@@ -19,12 +19,12 @@ function error(stage: string, message: string, status = 500) {
 export async function POST(request: Request) {
   if (!(await isAuthenticated(request))) return error("鉴权失败", "请重新登录。", 401);
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  const baseUrl = process.env.OPENAI_BASE_URL;
-  const model = process.env.OPENAI_MODEL;
-  if (!apiKey) return error("模型配置缺失", "服务端未配置 OPENAI_API_KEY。", 503);
-  if (!baseUrl) return error("模型配置缺失", "服务端未配置 OPENAI_BASE_URL。", 503);
-  if (!model) return error("模型配置缺失", "服务端未配置 OPENAI_MODEL。", 503);
+  const apiKey = process.env.API_KEY || process.env.OPENAI_API_KEY;
+  const baseUrl = process.env.BASE_URL || process.env.OPENAI_BASE_URL;
+  const model = process.env.MODEL || process.env.OPENAI_MODEL;
+  if (!apiKey) return error("模型配置缺失", "服务端未配置 API_KEY 或 OPENAI_API_KEY。", 503);
+  if (!baseUrl) return error("模型配置缺失", "服务端未配置 BASE_URL 或 OPENAI_BASE_URL。", 503);
+  if (!model) return error("模型配置缺失", "服务端未配置 MODEL 或 OPENAI_MODEL。", 503);
 
   let body: ModelRequest;
   try {

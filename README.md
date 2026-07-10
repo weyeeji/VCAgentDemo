@@ -21,7 +21,7 @@
    cp .env.example .env
    ```
 
-2. 在 `.env` 中填写 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`。
+2. 在 `.env` 中填写 `API_KEY`、`BASE_URL`、`MODEL`。项目也兼容 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`。
 3. 安装并启动：
 
    ```bash
@@ -37,9 +37,9 @@
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | 是 | OpenAI 兼容服务的 API Key，仅服务端使用 |
-| `OPENAI_BASE_URL` | 是 | 例如 `https://api.openai.com/v1`，服务端会请求 `/chat/completions` |
-| `OPENAI_MODEL` | 是 | 两个 Agent、评估器和 JSON 修复共用的模型名 |
+| `API_KEY` / `OPENAI_API_KEY` | 是 | OpenAI 兼容服务的 API Key，仅服务端使用；简写变量优先 |
+| `BASE_URL` / `OPENAI_BASE_URL` | 是 | 例如 `https://api.openai.com/v1`，服务端会请求 `/chat/completions` |
+| `MODEL` / `OPENAI_MODEL` | 是 | 两个 Agent、评估器和 JSON 修复共用的模型名 |
 | `OPENAI_TIMEOUT_MS` | 否 | 单次请求超时，默认 90000ms |
 | `AUTH_USERNAME` | 否 | 登录账号，默认 `user` |
 | `AUTH_PASSWORD` | 否 | 登录密码，默认 `test`；部署前必须修改 |

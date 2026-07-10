@@ -129,7 +129,22 @@ input:focus, textarea:focus, select:focus { border-color: var(--indigo); box-sha
 .processing-banner { max-width: 1040px; margin: 12px auto; padding: 10px; display: flex; justify-content: center; align-items: center; gap: 9px; border: 1px dashed #cbd2df; border-radius: 8px; color: #667085; font-size: 11px; }
 .error-stack { position: sticky; bottom: 8px; margin: 8px 20px; display: grid; gap: 5px; }
 
-.results-grid { flex: 1; min-height: 0; overflow: auto; display: grid; grid-template-columns: 1.12fr 1fr 1fr; gap: 12px; padding: 14px 18px; background: #f8f9fb; }
+.results-layout { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: #f8f9fb; }
+.evaluator-config { flex: none; margin: 12px 18px 0; border: 1px solid var(--line); border-radius: 9px; background: white; overflow: hidden; }
+.evaluator-config summary { min-height: 44px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; cursor: pointer; list-style: none; }
+.evaluator-config summary::-webkit-details-marker { display: none; }
+.evaluator-config summary > div { display: flex; align-items: center; gap: 8px; }
+.evaluator-config summary strong { font-size: 11px; }
+.evaluator-config summary em { color: #8d96a5; font-size: 9px; font-style: normal; font-weight: 400; }
+.evaluator-badge { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 7px; color: #775aa8; background: #f1ecfa; font-size: 10px; font-weight: 800; }
+.evaluator-summary-meta span { color: #8f98a7; font: 8px var(--font-geist-mono); }
+.evaluator-summary-meta b { padding: 3px 6px; border-radius: 9px; color: var(--teal); background: var(--teal-soft); font-size: 8px; font-weight: 650; }
+.evaluator-editor { display: grid; grid-template-columns: 180px 1fr 150px; gap: 10px; align-items: stretch; padding: 10px 12px 12px; border-top: 1px solid var(--line); }
+.evaluator-note { padding: 10px; border-radius: 6px; color: #697386; background: #f7f8fa; font-size: 9px; line-height: 1.65; }
+.evaluator-editor textarea { min-height: 105px; max-height: 170px; padding: 9px; resize: vertical; color: #364154; background: #fbfcfd; font: 9px/1.6 var(--font-geist-mono); }
+.evaluator-actions { display: flex; flex-direction: column; gap: 6px; }
+.evaluator-actions button { min-height: 29px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: #5c6677; background: white; font-size: 9px; }
+.results-grid { flex: 1; min-height: 0; overflow: auto; display: grid; grid-template-columns: 1.12fr 1fr 1fr; gap: 12px; padding: 12px 18px 14px; background: #f8f9fb; }
 .json-card { min-height: 0; overflow: hidden; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 9px; background: white; }
 .card-heading { min-height: 42px; padding: 7px 10px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .card-heading strong { font-size: 11px; }

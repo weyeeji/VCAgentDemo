@@ -613,6 +613,7 @@ export default function DemoApp() {
 
   const busy = ["running", "paused", "stopping", "postprocessing"].includes(status);
   const statusLabel: Record<RunStatus, string> = { idle: "未运行", running: "运行中", paused: "已暂停", stopping: "正在停止", postprocessing: "结果生成中", completed: "已完成", error: "运行失败" };
+  const actualEvaluatorCall = [...debugCalls].reverse().find((call) => call.type === "public_evaluation");
 
   return (
     <main className="app-shell">
@@ -664,10 +665,27 @@ export default function DemoApp() {
           <div className="conversation-pane"><Conversation messages={messages} runningRole={runningRole} status={status} />{errors.length > 0 && <div className="error-stack">{errors.map((error, index) => <div key={index}>! {error}</div>)}</div>}</div>
         </div>}
 
-        {tab === "results" && <div className="results-grid">
-          <JsonPanel title="公共匹配结果" value={publicResult} onChange={setPublicResult} error={rawErrors.public} />
-          <JsonPanel title="投资人私有记忆" value={investorMemory} onChange={setInvestorMemory} error={rawErrors.investorMemory} />
-          <JsonPanel title="创业者私有记忆" value={founderMemory} onChange={setFounderMemory} error={rawErrors.founderMemory} />
+        {tab === "results" && <div className="results-layout">
+          <details className="evaluator-config" open>
+            <summary>
+              <div><span className="evaluator-badge">评</span><strong>中立评估器提示词</strong><em>独立后处理节点 · 不参与双方对话</em></div>
+              <div className="evaluator-summary-meta"><span>{config.evaluatorPrompt.length} 字符 · ≈{tokenEstimate(config.evaluatorPrompt)} tokens</span><b>{config.settings.generatePublicResult ? "已启用" : "未生成公共结果"}</b></div>
+            </summary>
+            <div className="evaluator-editor">
+              <div className="evaluator-note">修改后自动保存，仅影响下一次模拟。公共结果调用只使用本提示词、双方公开资料和完整对话。</div>
+              <textarea value={config.evaluatorPrompt} onChange={(event) => persistConfig({ ...config, evaluatorPrompt: event.target.value })} />
+              <div className="evaluator-actions">
+                <button onClick={() => persistConfig({ ...config, evaluatorPrompt: DEFAULT_CONFIG.evaluatorPrompt })}>↺ 恢复默认</button>
+                <button onClick={() => setPromptModal({ title: "中立评估器 · 当前将使用的提示词", content: config.evaluatorPrompt })}>查看当前提交提示词</button>
+                <button disabled={!actualEvaluatorCall} onClick={() => actualEvaluatorCall && setPromptModal({ title: "中立评估器 · 本次运行实际提示词快照", content: actualEvaluatorCall.systemPrompt })}>查看本次实际提示词</button>
+              </div>
+            </div>
+          </details>
+          <div className="results-grid">
+            <JsonPanel title="公共匹配结果" value={publicResult} onChange={setPublicResult} error={rawErrors.public} />
+            <JsonPanel title="投资人私有记忆" value={investorMemory} onChange={setInvestorMemory} error={rawErrors.investorMemory} />
+            <JsonPanel title="创业者私有记忆" value={founderMemory} onChange={setFounderMemory} error={rawErrors.founderMemory} />
+          </div>
         </div>}
         {tab === "debug" && <DebugList calls={debugCalls} />}
       </section>

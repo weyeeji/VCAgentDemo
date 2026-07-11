@@ -178,7 +178,23 @@ export interface SavedVersion {
   config: AppConfig;
 }
 
-export type FieldInputType = "text" | "textarea" | "select" | "multiselect";
+export interface WorkspaceState {
+  schemaVersion: 1;
+  config: AppConfig;
+  versions: SavedVersion[];
+  records: SimulationRecord[];
+  memories: Record<AgentRole, unknown | null>;
+  dailyReports: Record<AgentRole, unknown | null>;
+  activeVersion: string | null;
+  activeRecordId: string | null;
+  updatedAt: string | null;
+}
+
+export type WorkspaceStatePatch = Partial<Pick<WorkspaceState,
+  "config" | "versions" | "records" | "memories" | "dailyReports" | "activeVersion" | "activeRecordId"
+>>;
+
+export type FieldInputType = "text" | "textarea" | "select" | "multiselect" | "date";
 
 export interface FieldDefinition {
   key: string;
@@ -186,6 +202,8 @@ export interface FieldDefinition {
   input: FieldInputType;
   required: boolean;
   options?: string[];
+  exclusiveOptions?: string[];
+  maxSelections?: number;
   placeholder?: string;
   help?: string;
 }

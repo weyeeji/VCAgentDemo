@@ -16,6 +16,7 @@ function db(): DatabaseSync {
   mkdirSync(DATA_DIR, { recursive: true });
   const database = new DatabaseSync(path.join(DATA_DIR, "app.db"));
   database.exec("PRAGMA journal_mode = WAL");
+  database.exec("PRAGMA busy_timeout = 5000");
   database.exec(`CREATE TABLE IF NOT EXISTS login_attempts (
     key_hash TEXT PRIMARY KEY,
     failure_count INTEGER NOT NULL,

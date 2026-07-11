@@ -22,6 +22,7 @@ function db(): DatabaseSync {
   if (globalThis.__ventureFileDb) return globalThis.__ventureFileDb;
   const database = new DatabaseSync(DB_PATH);
   database.exec("PRAGMA journal_mode = WAL");
+  database.exec("PRAGMA busy_timeout = 5000");
   database.exec("PRAGMA foreign_keys = ON");
   database.exec(`
     CREATE TABLE IF NOT EXISTS agent_files (

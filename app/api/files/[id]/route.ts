@@ -1,9 +1,10 @@
-import { isAuthenticated } from "@/lib/auth";
+import { isAuthenticated, isSameOrigin } from "@/lib/auth";
 import { deleteAgentFile, isAgentRole } from "@/lib/file-store";
 
 export const runtime = "nodejs";
 
 export async function DELETE(request: Request, context: { params: Promise<{ id: string }> }) {
+  if (!isSameOrigin(request)) return Response.json({ error: "请求来源无效。" }, { status: 403 });
   if (!(await isAuthenticated(request))) return Response.json({ error: "请重新登录。" }, { status: 401 });
   const role = new URL(request.url).searchParams.get("role");
   if (!isAgentRole(role)) return Response.json({ error: "无效的 Agent 角色。" }, { status: 400 });

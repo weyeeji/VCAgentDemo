@@ -1,9 +1,7 @@
-const encoder = new TextEncoder();
-const ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
-const MAX_ATTEMPTS = 5;
+import { hashedAttemptKey } from "./auth-store";
+export { canAttempt, clearFailures, recordFailure } from "./auth-store";
 
-type Attempt = { count: number; resetAt: number };
-const attempts = new Map<string, Attempt>();
+const encoder = new TextEncoder();
 
 function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -16,7 +14,7 @@ function textToBase64Url(value: string): string {
 }
 
 async function hmac(value: string): Promise<string> {
-  const secret = process.env.AUTH_SESSION_SECRET || "local-demo-change-this-secret-before-deploying";
+  const secret = sessionSecret();
   const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
   return bytesToBase64Url(new Uint8Array(signature));
@@ -33,29 +31,32 @@ function safeEqual(left: Uint8Array, right: Uint8Array): boolean {
   return mismatch === 0;
 }
 
-export function rateLimitKey(request: Request): string {
-  return request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "local";
-}
-
-export function canAttempt(key: string): { allowed: boolean; retryAfter: number } {
-  const now = Date.now();
-  const current = attempts.get(key);
-  if (!current || current.resetAt <= now) {
-    attempts.set(key, { count: 0, resetAt: now + ATTEMPT_WINDOW_MS });
-    return { allowed: true, retryAfter: 0 };
+function sessionSecret(): string {
+  const configured = process.env.AUTH_SESSION_SECRET;
+  if (process.env.NODE_ENV === "production" && (!configured || configured.length < 32 || configured.startsWith("replace-with"))) {
+    throw new Error("生产环境必须配置至少 32 字符的 AUTH_SESSION_SECRET。");
   }
-  return { allowed: current.count < MAX_ATTEMPTS, retryAfter: Math.ceil((current.resetAt - now) / 1000) };
+  return configured || "local-demo-change-this-secret-before-deploying";
 }
 
-export function recordFailure(key: string): void {
-  const now = Date.now();
-  const current = attempts.get(key);
-  if (!current || current.resetAt <= now) attempts.set(key, { count: 1, resetAt: now + ATTEMPT_WINDOW_MS });
-  else attempts.set(key, { ...current, count: current.count + 1 });
+export function rateLimitKey(request: Request, username: string): string {
+  const trustProxy = process.env.TRUST_PROXY === "1";
+  const client = trustProxy
+    ? request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "proxy-unknown"
+    : "direct-client";
+  return hashedAttemptKey(`${client}\n${username.toLowerCase()}`);
 }
 
-export function clearFailures(key: string): void {
-  attempts.delete(key);
+export function isSameOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) return false;
+  if (process.env.APP_ORIGIN) return origin === process.env.APP_ORIGIN.replace(/\/$/, "");
+  if (process.env.TRUST_PROXY === "1") {
+    const host = request.headers.get("x-forwarded-host") || request.headers.get("host");
+    const protocol = request.headers.get("x-forwarded-proto") || "https";
+    return Boolean(host && origin === `${protocol}://${host}`);
+  }
+  return origin === new URL(request.url).origin;
 }
 
 export async function verifyCredentials(username: string, password: string): Promise<boolean> {
@@ -77,7 +78,11 @@ export async function isAuthenticated(request: Request): Promise<boolean> {
   const token = cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("vc_session="))?.slice("vc_session=".length);
   if (!token) return false;
   const [payload, signature] = token.split(".");
-  if (!payload || !signature || !safeEqual(encoder.encode(signature), encoder.encode(await hmac(payload)))) return false;
+  try {
+    if (!payload || !signature || !safeEqual(encoder.encode(signature), encoder.encode(await hmac(payload)))) return false;
+  } catch {
+    return false;
+  }
   try {
     const decoded = JSON.parse(atob(payload.replaceAll("-", "+").replaceAll("_", "/")));
     return typeof decoded.exp === "number" && decoded.exp > Date.now();

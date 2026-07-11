@@ -8,7 +8,8 @@ services:
       NODE_ENV: production
       DATA_DIR: /app/data
     ports:
-      - "3000:3000"
+      # 默认只暴露给本机反向代理，避免绕过 HTTPS / IP 白名单直接访问容器。
+      - "127.0.0.1:3000:3000"
     volumes:
       - venture-agent-data:/app/data
 

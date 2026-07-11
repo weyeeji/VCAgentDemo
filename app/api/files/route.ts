@@ -1,4 +1,4 @@
-import { isAuthenticated } from "@/lib/auth";
+import { isAuthenticated, isSameOrigin } from "@/lib/auth";
 import { isAgentRole, listAgentFiles, storeAgentFile } from "@/lib/file-store";
 
 export const runtime = "nodejs";
@@ -11,6 +11,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  if (!isSameOrigin(request)) return Response.json({ error: "请求来源无效。" }, { status: 403 });
   if (!(await isAuthenticated(request))) return Response.json({ error: "请重新登录。" }, { status: 401 });
   const contentLength = Number(request.headers.get("content-length") || 0);
   if (contentLength > 22 * 1024 * 1024) return Response.json({ error: "本次上传内容过大。" }, { status: 413 });

@@ -195,6 +195,23 @@ input:focus, textarea:focus, select:focus { border-color: var(--indigo); box-sha
 .field-grid .full { grid-column: 1 / -1; }
 .field-grid input, .field-grid textarea { width: 100%; min-height: 34px; padding: 7px 9px; color: #384355; font-size: 11px; font-weight: 400; }
 .field-grid textarea { min-height: 60px; resize: vertical; line-height: 1.5; }
+.field-grid select { width: 100%; min-height: 34px; padding: 6px 8px; color: #384355; font-size: 11px; font-weight: 400; }
+.field-grid small, .choice-field small { color: #929baa; font-size: 8px; font-weight: 400; }
+.field-label { display: flex; align-items: center; gap: 6px; }
+.field-label b, .field-label em { padding: 2px 5px; border-radius: 8px; font-size: 7px; font-style: normal; font-weight: 650; }
+.field-label b { color: var(--indigo); background: var(--indigo-soft); }
+.teal .field-label b { color: var(--teal); background: var(--teal-soft); }
+.field-label em { color: #8b94a2; background: #f0f2f5; }
+.questionnaire-note { margin: 0 18px 12px; padding: 8px 10px; border-radius: 6px; color: #697386; background: #f7f8fa; font-size: 9px; line-height: 1.55; }
+.advanced-profile { border-top: 1px solid #eef0f4; }
+.choice-field { min-width: 0; margin: 0; padding: 0; border: 0; }
+.choice-field legend { margin-bottom: 7px; color: #4d5667; font-size: 12px; font-weight: 650; }
+.choice-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.choice-chips label { display: block; cursor: pointer; }
+.choice-chips input { position: absolute; opacity: 0; pointer-events: none; }
+.choice-chips span { display: block; padding: 5px 8px; border: 1px solid var(--line); border-radius: 12px; color: #697386; background: #fafbfc; font-size: 9px; font-weight: 500; transition: .15s; }
+.choice-chips label.selected span { color: var(--indigo); border-color: #bfc5fa; background: var(--indigo-soft); }
+.teal .choice-chips label.selected span { color: var(--teal); border-color: #a9d8d2; background: var(--teal-soft); }
 .agent-files-section { background: white; border-bottom: 1px solid var(--line); }
 .agent-files-section > summary { min-height: 44px; padding: 0 18px; display: flex; align-items: center; justify-content: space-between; cursor: pointer; list-style: none; }
 .agent-files-section > summary::-webkit-details-marker { display: none; }
@@ -239,6 +256,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--indigo); box-sha
 .tiny-toggle.on { background: var(--indigo); }.teal .tiny-toggle.on { background: var(--teal); }
 .tiny-toggle.on span { transform: translateX(11px); }
 .layer-body { padding: 0 10px 9px; border-top: 1px solid #edf0f4; }
+.variant-row { display: grid; grid-template-columns: 1fr auto auto; gap: 6px; margin-top: 9px; }
+.variant-row select, .variant-row button { min-height: 28px; padding: 0 7px; border: 1px solid var(--line); border-radius: 5px; color: #687386; background: white; font-size: 8px; }
 .layer-body textarea { width: 100%; min-height: 128px; margin-top: 9px; padding: 9px; resize: vertical; color: #3b4658; background: #fbfcfd; font: 9px/1.65 var(--font-geist-mono); }
 .tool-contract { margin-top: 6px; padding: 7px 8px; display: flex; align-items: center; gap: 8px; border-radius: 5px; color: #8b94a2; background: #f3f5f8; font-size: 8px; }
 .tool-contract.connected span { color: var(--teal); }
@@ -247,6 +266,35 @@ input:focus, textarea:focus, select:focus { border-color: var(--indigo); box-sha
 .text-button { border: 0; background: transparent; padding: 7px 0 0; color: #7d8797; font-size: 9px; }
 .private-memory { padding: 6px 14px 22px; }
 .private-memory .json-card { min-height: 180px; }
+
+.postprocess-prompts { flex: none; max-height: 260px; overflow: auto; }
+.postprocess-prompts .evaluator-config { margin-top: 8px; }
+.daily-layout { flex: 1; min-height: 0; overflow: auto; padding: 14px 18px 20px; background: #f8f9fb; }
+.daily-intro { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 9px; background: white; }
+.daily-intro > div { display: grid; gap: 4px; }
+.daily-intro strong { font-size: 12px; }
+.daily-intro span { color: #7e8796; font-size: 9px; line-height: 1.5; }
+.daily-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+.daily-card { min-width: 0; padding: 12px; border: 1px solid var(--line); border-top: 3px solid var(--indigo); border-radius: 9px; background: white; }
+.daily-card.founder { border-top-color: var(--teal); }
+.daily-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.daily-card-head > div { display: flex; align-items: center; gap: 8px; }
+.daily-card-head > div > span { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; color: var(--indigo); background: var(--indigo-soft); font-size: 10px; font-weight: 800; }
+.daily-card.founder .daily-card-head > div > span { color: var(--teal); background: var(--teal-soft); }
+.daily-card-head div div { display: grid; gap: 2px; }
+.daily-card-head strong { font-size: 11px; }
+.daily-card-head em { color: #8e97a6; font-size: 8px; font-style: normal; }
+.daily-card-head button { min-height: 29px; padding: 0 10px; border-radius: 6px; font-size: 9px; }
+.daily-prompt { display: grid; gap: 6px; margin-top: 9px; color: #4d5667; font-size: 10px; font-weight: 700; }
+.daily-prompt span { display: flex; justify-content: space-between; }
+.daily-prompt em { color: #929baa; font-size: 8px; font-style: normal; font-weight: 400; }
+.daily-prompt textarea { min-height: 105px; padding: 8px; resize: vertical; color: #364154; background: #fbfcfd; font: 9px/1.55 var(--font-geist-mono); }
+.daily-variants { margin-top: 6px; }
+.daily-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 6px; margin: 9px 0; }
+.daily-actions label { display: grid; gap: 4px; color: #7b8493; font-size: 8px; }
+.daily-actions input { width: 105px; height: 29px; padding: 0 7px; font-size: 9px; }
+.daily-actions button { min-height: 29px; padding: 0 7px; border: 1px solid var(--line); border-radius: 5px; color: #657083; background: white; font-size: 8px; }
+.daily-card .json-card { min-height: 260px; max-height: 420px; }
 
 .modal-backdrop, .drawer-backdrop { position: fixed; inset: 0; z-index: 70; background: rgba(18,25,38,.48); backdrop-filter: blur(2px); }
 .modal-backdrop { display: grid; place-items: center; }

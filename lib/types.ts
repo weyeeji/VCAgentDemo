@@ -1,9 +1,17 @@
 export type AgentRole = "investor" | "founder";
 export type LayerKey = "platform" | "tools" | "user" | "task" | "dynamic";
 
+export interface PromptVariant {
+  id: string;
+  name: string;
+  content: string;
+  createdAt: string;
+}
+
 export interface PromptLayer {
   enabled: boolean;
   content: string;
+  variants: PromptVariant[];
 }
 
 export type PromptLayers = Record<LayerKey, PromptLayer>;
@@ -26,11 +34,22 @@ export interface RunSettings {
   outputPricePerMillion: number;
 }
 
+export interface DailyReportConfig {
+  taskPrompt: string;
+  dynamicPrompt: string;
+  taskVariants: PromptVariant[];
+  dynamicVariants: PromptVariant[];
+  maxTokens: number;
+}
+
 export interface AppConfig {
   investor: AgentProfile;
   founder: AgentProfile;
   settings: RunSettings;
   evaluatorPrompt: string;
+  memoryPrompts: Record<AgentRole, string>;
+  jsonRepairPrompt: string;
+  dailyReport: Record<AgentRole, DailyReportConfig>;
 }
 
 export interface TurnControl {
@@ -72,6 +91,8 @@ export interface DebugCall {
     | "public_evaluation"
     | "investor_memory"
     | "founder_memory"
+    | "investor_daily_report"
+    | "founder_daily_report"
     | "json_repair";
   actor: "investor" | "founder" | "evaluator" | "system";
   round: number | null;
@@ -135,11 +156,13 @@ export interface SimulationRecord {
   configSnapshot: AppConfig;
   promptSnapshots: { investor: string; founder: string };
   fileSnapshots: Record<AgentRole, AgentFileRecord[]>;
+  memorySnapshots: Record<AgentRole, unknown | null>;
   messages: TurnMessage[];
   results: {
     public: unknown | null;
     investorMemory: unknown | null;
     founderMemory: unknown | null;
+    dailyReports: Record<AgentRole, unknown | null>;
     rawErrors: Record<string, { raw: string; error: string }>;
   };
   debugCalls: DebugCall[];
@@ -153,4 +176,16 @@ export interface SavedVersion {
   name: string;
   createdAt: string;
   config: AppConfig;
+}
+
+export type FieldInputType = "text" | "textarea" | "select" | "multiselect";
+
+export interface FieldDefinition {
+  key: string;
+  label: string;
+  input: FieldInputType;
+  required: boolean;
+  options?: string[];
+  placeholder?: string;
+  help?: string;
 }

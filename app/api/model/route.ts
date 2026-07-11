@@ -1,4 +1,4 @@
-import { isAuthenticated } from "@/lib/auth";
+import { isAuthenticated, isSameOrigin } from "@/lib/auth";
 import { PRIVATE_FILE_TOOL, isAgentRole, searchAgentFiles } from "@/lib/file-store";
 import type { AgentRole, ToolExecutionTrace } from "@/lib/types";
 
@@ -68,6 +68,7 @@ function addUsage(total: Required<Usage>, usage?: Usage) {
 }
 
 export async function POST(request: Request) {
+  if (!isSameOrigin(request)) return error("请求来源无效", "仅接受同源请求。", 403);
   if (!(await isAuthenticated(request))) return error("鉴权失败", "请重新登录。", 401);
 
   const apiKey = process.env.API_KEY || process.env.OPENAI_API_KEY;
@@ -84,10 +85,18 @@ export async function POST(request: Request) {
     return error("请求解析失败", "请求体不是合法 JSON。", 400);
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) return error("请求校验失败", "messages 不能为空。", 400);
+  if (body.messages.length > 100) return error("请求校验失败", "messages 不能超过 100 条。", 400);
+  const allowedRoles = new Set(["system", "user", "assistant"]);
+  let totalMessageChars = 0;
+  for (const message of body.messages) {
+    if (!message || !allowedRoles.has(message.role) || typeof message.content !== "string") return error("请求校验失败", "仅接受 system、user、assistant 文本消息。", 400);
+    totalMessageChars += message.content.length;
+  }
+  if (totalMessageChars > 600_000) return error("请求校验失败", "消息总长度不能超过 600,000 字符。", 413);
   const activeRole = isAgentRole(body.agentRole) ? body.agentRole : null;
   const toolsEnabled = Boolean(body.toolsEnabled && activeRole);
-  const fileIds = Array.isArray(body.fileIds) ? body.fileIds.filter((value): value is string => typeof value === "string") : [];
-  const messages: ModelMessage[] = body.messages.map((message) => ({ ...message }));
+  const fileIds = Array.isArray(body.fileIds) ? body.fileIds.filter((value): value is string => typeof value === "string").slice(0, 20) : [];
+  const messages: ModelMessage[] = body.messages.map((message) => ({ role: message.role, content: message.content }));
 
   const controller = new AbortController();
   const timeoutMs = Math.max(5_000, Number(process.env.OPENAI_TIMEOUT_MS || 90_000));

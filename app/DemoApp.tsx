@@ -13,6 +13,7 @@ import {
 } from "@/lib/defaults";
 import type {
   AgentProfile,
+  AgentFileRecord,
   AgentRole,
   AppConfig,
   DebugCall,
@@ -21,6 +22,7 @@ import type {
   SimulationRecord,
   TurnControl,
   TurnMessage,
+  ToolExecutionTrace,
 } from "@/lib/types";
 
 const CONFIG_KEY = "vc-agent-debugger:config:v1";
@@ -39,6 +41,18 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
 }
 
+function migrateConfig(value: AppConfig): AppConfig {
+  const migrated = clone(value);
+  (["investor", "founder"] as AgentRole[]).forEach((role) => {
+    const toolLayer = migrated?.[role]?.prompts?.tools;
+    if (toolLayer?.content?.startsWith("当前版本没有可用的外部工具。不得虚构已查询数据库")) {
+      toolLayer.content = DEFAULT_CONFIG[role].prompts.tools.content;
+    }
+  });
+  if (!migrated.evaluatorPrompt) migrated.evaluatorPrompt = DEFAULT_CONFIG.evaluatorPrompt;
+  return migrated;
+}
+
 function tokenEstimate(text: string) {
   const ascii = (text.match(/[\x00-\x7F]/g) || []).length;
   return Math.max(1, Math.ceil((text.length - ascii) / 1.7 + ascii / 4));
@@ -50,6 +64,12 @@ function money(value: number) {
 
 function formatDuration(ms: number) {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function downloadJson(filename: string, value: unknown) {
@@ -217,19 +237,94 @@ function PromptLayerEditor({ role, layerKey, agent, onChange }: {
       </div>
       {open && <div className="layer-body">
         <textarea value={layer.content} placeholder={layerKey === "dynamic" ? "当前为空；可手动注入实时状态或外部事件" : "输入提示词"} onChange={(event) => onChange({ ...agent, prompts: { ...agent.prompts, [layerKey]: { ...layer, content: event.target.value } } })} />
+        {layerKey === "tools" && <div className={`tool-contract ${layer.enabled ? "connected" : ""}`}><span>{layer.enabled ? "● 已连接真实工具" : "○ 工具已停用"}</span><code>search_private_files(query, top_k)</code><em>服务端强制限定为当前 Agent 文件库</em></div>}
         <button className="text-button" onClick={() => onChange({ ...agent, prompts: { ...agent.prompts, [layerKey]: { ...layer, content: defaultLayer(role, layerKey) } } })}>↺ 恢复默认</button>
       </div>}
     </section>
   );
 }
 
-function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview }: {
+function AgentFilePanel({ role, files, disabled, onFilesChange }: {
+  role: AgentRole;
+  files: AgentFileRecord[];
+  disabled: boolean;
+  onFilesChange: (files: AgentFileRecord[]) => void;
+}) {
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  async function refresh() {
+    const response = await fetch(`/api/files?role=${role}`, { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "读取文件列表失败");
+    onFilesChange(data.files || []);
+  }
+
+  async function upload(selected: FileList | null) {
+    if (!selected?.length) return;
+    setWorking(true); setError("");
+    try {
+      const form = new FormData();
+      form.append("role", role);
+      Array.from(selected).slice(0, 5).forEach((file) => form.append("files", file));
+      const response = await fetch("/api/files", { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "上传失败");
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "上传失败");
+    } finally {
+      setWorking(false);
+      if (inputRef.current) inputRef.current.value = "";
+    }
+  }
+
+  async function remove(file: AgentFileRecord) {
+    if (!window.confirm(`删除“${file.originalName}”？此操作会同时删除服务器中的原文件和索引。`)) return;
+    setWorking(true); setError("");
+    try {
+      const response = await fetch(`/api/files/${file.id}?role=${role}`, { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "删除失败");
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "删除失败");
+    } finally { setWorking(false); }
+  }
+
+  return <details open className="agent-files-section">
+    <summary><div><span>私有文件库</span><em>仅{ROLE_LABEL[role]} Agent 可检索</em></div><b>{files.filter((file) => file.status === "ready").length} / 20</b></summary>
+    <div className="agent-files-body">
+      <label className={`file-drop ${disabled || working ? "disabled" : ""}`}>
+        <input ref={inputRef} type="file" multiple accept=".pdf,.docx,.txt,.md,.markdown,.csv" disabled={disabled || working} onChange={(event) => upload(event.target.files)} />
+        <span>{working ? "正在解析并建立索引…" : "＋ 上传 PDF、DOCX、TXT、Markdown 或 CSV"}</span>
+        <small>单文件 ≤ 10MB · 每次最多 5 个 · 文件持久化在服务器 data/ 目录</small>
+      </label>
+      {disabled && <div className="files-run-note">模拟运行期间文件快照已冻结，结束后可继续上传或删除。</div>}
+      {error && <div className="inline-error">{error}</div>}
+      <div className="file-list">
+        {files.length ? files.map((file) => <article key={file.id}>
+          <div className={`file-icon ${file.status}`}>{file.originalName.split(".").pop()?.slice(0, 4).toUpperCase()}</div>
+          <div className="file-info"><strong title={file.originalName}>{file.originalName}</strong><span>{formatBytes(file.size)} · {file.status === "ready" ? `${file.chunkCount} 个检索片段` : file.status === "processing" ? "处理中" : "解析失败"}</span>{file.error && <em>{file.error}</em>}</div>
+          <span className={`file-status ${file.status}`}>{file.status === "ready" ? "可检索" : file.status === "processing" ? "处理中" : "失败"}</span>
+          <button disabled={disabled || working} onClick={() => remove(file)}>删除</button>
+        </article>) : <div className="empty-file-list">尚未上传文件。没有文件时，工具会返回空结果。</div>}
+      </div>
+    </div>
+  </details>;
+}
+
+function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, files, filesDisabled, onFilesChange }: {
   role: AgentRole;
   config: AppConfig;
   onConfig: (config: AppConfig) => void;
   memory: unknown | null;
   onMemory: (value: unknown) => void;
   promptPreview: () => void;
+  files: AgentFileRecord[];
+  filesDisabled: boolean;
+  onFilesChange: (files: AgentFileRecord[]) => void;
 }) {
   const agent = config[role];
   const color = role === "investor" ? "indigo" : "teal";
@@ -247,6 +342,7 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview }:
           {FIELD_DEFINITIONS[role].map((field) => <label key={field.key} className={field.multiline ? "full" : ""}>{field.label}{field.multiline ? <textarea value={agent.fields[field.key] || ""} onChange={(event) => update({ ...agent, fields: { ...agent.fields, [field.key]: event.target.value } })} /> : <input value={agent.fields[field.key] || ""} onChange={(event) => update({ ...agent, fields: { ...agent.fields, [field.key]: event.target.value } })} />}</label>)}
         </div>
       </details>
+      <AgentFilePanel role={role} files={files} disabled={filesDisabled} onFilesChange={onFilesChange} />
       <div className="section-label"><span>五层提示词</span><span>按固定顺序组合</span></div>
       {(Object.keys(LAYER_LABELS) as LayerKey[]).map((key) => <PromptLayerEditor key={key} role={role} layerKey={key} agent={agent} onChange={update} />)}
       <div className="private-memory">
@@ -286,6 +382,7 @@ function DebugList({ calls }: { calls: DebugCall[] }) {
       <h4>层级开关</h4><pre>{JSON.stringify(call.layerStates, null, 2)}</pre>
       <h4>Agent 信息快照</h4><pre>{JSON.stringify(call.profileSnapshot, null, 2)}</pre>
       <h4>消息历史</h4><pre>{JSON.stringify(call.messages, null, 2)}</pre>
+      {call.toolCalls?.length ? <><h4>真实工具调用与检索结果</h4><pre>{JSON.stringify(call.toolCalls, null, 2)}</pre></> : null}
       <h4>原始模型返回</h4><pre>{call.rawResponse || "（无）"}</pre>
       <h4>解析结果</h4><pre>{JSON.stringify(call.parsedResult, null, 2)}</pre>
     </div>
@@ -297,6 +394,7 @@ export default function DemoApp() {
   const [config, setConfig] = useState<AppConfig>(() => deepCloneConfig(DEFAULT_CONFIG));
   const [versions, setVersions] = useState<SavedVersion[]>([]);
   const [records, setRecords] = useState<SimulationRecord[]>([]);
+  const [agentFiles, setAgentFiles] = useState<Record<AgentRole, AgentFileRecord[]>>({ investor: [], founder: [] });
   const [activeVersion, setActiveVersion] = useState<string | null>(null);
   const [tab, setTab] = useState<TopTab>("conversation");
   const [status, setStatus] = useState<RunStatus>("idle");
@@ -318,6 +416,7 @@ export default function DemoApp() {
   const pauseRef = useRef(false);
   const stopRef = useRef(false);
   const lastRunRef = useRef<AppConfig | null>(null);
+  const lastRunFilesRef = useRef<Record<AgentRole, AgentFileRecord[]> | null>(null);
 
   useEffect(() => {
     fetch("/api/auth/session").then((response) => {
@@ -329,7 +428,7 @@ export default function DemoApp() {
         const saved = localStorage.getItem(CONFIG_KEY);
         const savedVersions = localStorage.getItem(VERSION_KEY);
         const savedRecords = localStorage.getItem(RECORD_KEY);
-        if (saved) setConfig(JSON.parse(saved));
+        if (saved) setConfig(migrateConfig(JSON.parse(saved)));
         if (savedVersions) setVersions(JSON.parse(savedVersions));
         if (savedRecords) setRecords(JSON.parse(savedRecords));
       } catch {}
@@ -342,6 +441,12 @@ export default function DemoApp() {
   useEffect(() => {
     if (auth !== "signed-in") return;
     fetch("/api/health").then((response) => response.json()).then(setApiState).catch(() => setApiState({ configured: false, missing: ["无法连接服务端"], model: null }));
+    Promise.all((["investor", "founder"] as AgentRole[]).map(async (role) => {
+      const response = await fetch(`/api/files?role=${role}`, { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "读取文件列表失败");
+      return [role, data.files || []] as const;
+    })).then((entries) => setAgentFiles(Object.fromEntries(entries) as Record<AgentRole, AgentFileRecord[]>)).catch((caught) => setErrors((current) => [...current, `文件库加载失败：${caught instanceof Error ? caught.message : String(caught)}`]));
   }, [auth]);
   useEffect(() => {
     if (!toast) return;
@@ -353,11 +458,12 @@ export default function DemoApp() {
 
   function persistConfig(next: AppConfig) { setConfig(next); }
 
-  function newRecord(snapshot: AppConfig): SimulationRecord {
+  function newRecord(snapshot: AppConfig, fileSnapshots: Record<AgentRole, AgentFileRecord[]>): SimulationRecord {
     return {
       conversationId: id("conv"), createdAt: new Date().toISOString(), completedAt: null,
       configVersion: activeVersion, configSnapshot: clone(snapshot),
       promptSnapshots: { investor: composePrompt(snapshot.investor, snapshot.settings), founder: composePrompt(snapshot.founder, snapshot.settings) },
+      fileSnapshots: clone(fileSnapshots),
       messages: [], results: { public: null, investorMemory: null, founderMemory: null, rawErrors: {} },
       debugCalls: [], stats: { inputTokens: 0, outputTokens: 0, estimatedCost: 0 }, endReason: null, errors: [],
     };
@@ -375,6 +481,7 @@ export default function DemoApp() {
     record: SimulationRecord; type: DebugCall["type"]; actor: DebugCall["actor"]; round: number | null;
     systemPrompt: string; layerStates?: Record<string, boolean>; profile?: Record<string, string> | null;
     messages: Array<{ role: "system" | "user" | "assistant"; content: string }>; maxTokens: number; snapshot: AppConfig;
+    agentRole?: AgentRole; fileIds?: string[]; toolsEnabled?: boolean;
   }) {
     const started = Date.now();
     const startedAt = new Date().toISOString();
@@ -385,15 +492,25 @@ export default function DemoApp() {
     let outputTokens = 0;
     let usageEstimated = true;
     let callError: string | null = null;
+    let toolCalls: ToolExecutionTrace[] = [];
+    let rawTrace = "";
     abortRef.current = new AbortController();
     try {
       const response = await fetch("/api/model", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: params.messages, maxTokens: params.maxTokens }), signal: abortRef.current.signal,
+        body: JSON.stringify({
+          messages: params.messages,
+          maxTokens: params.maxTokens,
+          agentRole: params.agentRole,
+          fileIds: params.fileIds,
+          toolsEnabled: params.toolsEnabled,
+        }), signal: abortRef.current.signal,
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
       raw = data.content;
+      toolCalls = Array.isArray(data.toolCalls) ? data.toolCalls : [];
+      rawTrace = Array.isArray(data.trace) ? JSON.stringify(data.trace, null, 2) : "";
       if (data.usage?.prompt_tokens != null && data.usage?.completion_tokens != null) {
         inputTokens = Number(data.usage.prompt_tokens);
         outputTokens = Number(data.usage.completion_tokens);
@@ -411,10 +528,10 @@ export default function DemoApp() {
       const debug: DebugCall = {
         id: id("call"), type: params.type, actor: params.actor, round: params.round,
         systemPrompt: params.systemPrompt, layerStates: params.layerStates || {}, profileSnapshot: params.profile ?? null,
-        messages: clone(params.messages), rawResponse: raw, parsedResult: parsed,
+        messages: clone(params.messages), rawResponse: rawTrace || raw, parsedResult: parsed,
         startedAt, endedAt: new Date(ended).toISOString(), durationMs: ended - started,
         inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, usageEstimated, estimatedCost: cost,
-        success: !callError, error: callError,
+        success: !callError, error: callError, toolCalls,
       };
       params.record.debugCalls.push(debug);
       setDebugCalls([...params.record.debugCalls]);
@@ -454,6 +571,9 @@ export default function DemoApp() {
           profile: isPublic ? null : snapshot[role].fields,
           messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
           maxTokens: Math.max(1200, snapshot.settings.maxTokens), snapshot,
+          agentRole: isPublic ? undefined : role,
+          fileIds: isPublic ? undefined : record.fileSnapshots[role].filter((file) => file.status === "ready").map((file) => file.id),
+          toolsEnabled: !isPublic && snapshot[role].prompts.tools.enabled,
         });
         const result = await parseWithRepair(response.raw, type, record, snapshot);
         record.results[kind] = result;
@@ -477,9 +597,10 @@ export default function DemoApp() {
     }
   }
 
-  async function runSimulation(snapshot: AppConfig) {
-    const record = newRecord(snapshot);
+  async function runSimulation(snapshot: AppConfig, filesSnapshot: Record<AgentRole, AgentFileRecord[]>) {
+    const record = newRecord(snapshot, filesSnapshot);
     lastRunRef.current = snapshot;
+    lastRunFilesRef.current = clone(filesSnapshot);
     stopRef.current = false;
     pauseRef.current = false;
     setMessages([]); setDebugCalls([]); setPublicResult(null); setInvestorMemory(null); setFounderMemory(null); setRawErrors({}); setErrors([]); setTab("conversation");
@@ -509,6 +630,9 @@ export default function DemoApp() {
               record, type: role === "investor" ? "investor_turn" : "founder_turn", actor: role, round, systemPrompt,
               layerStates: Object.fromEntries(Object.entries(agent.prompts).map(([key, layer]) => [key, layer.enabled])), profile: clone(agent.fields),
               messages: apiMessages, maxTokens: snapshot.settings.maxTokens, snapshot,
+              agentRole: role,
+              fileIds: filesSnapshot[role].filter((file) => file.status === "ready").map((file) => file.id),
+              toolsEnabled: agent.prompts.tools.enabled,
             });
             const parsed = await parseWithRepair(response.raw, `${ROLE_LABEL[role]}第 ${round} 轮对话回复，必须包含 message 和 control`, record, snapshot);
             const parsedRecord = asRecord(parsed);
@@ -563,7 +687,7 @@ export default function DemoApp() {
 
   function start() {
     if (["running", "paused", "postprocessing"].includes(status)) return;
-    runSimulation(clone(config));
+    runSimulation(clone(config), clone(agentFiles));
   }
 
   function stop() {
@@ -591,7 +715,7 @@ export default function DemoApp() {
       try {
         const parsed = JSON.parse(String(reader.result));
         if (!parsed?.investor?.prompts || !parsed?.founder?.prompts || !parsed?.settings) throw new Error("缺少必要字段");
-        setConfig(parsed); setActiveVersion(null); setToast("配置已导入");
+        setConfig(migrateConfig(parsed)); setActiveVersion(null); setToast("配置已导入");
       } catch (caught) { setToast(`导入失败：${caught instanceof Error ? caught.message : "格式错误"}`); }
     };
     reader.readAsText(file);
@@ -657,7 +781,7 @@ export default function DemoApp() {
               {status === "running" && <button onClick={() => { pauseRef.current = true; setStatus("paused"); }}>Ⅱ 暂停</button>}
               {status === "paused" && <button className="primary" onClick={() => { pauseRef.current = false; setStatus("running"); }}>▶ 继续</button>}
               {busy && <button className="danger" onClick={stop}>■ 停止</button>}
-              {!busy && messages.length > 0 && <button onClick={() => runSimulation(clone(lastRunRef.current || config))}>↻ 重新生成</button>}
+              {!busy && messages.length > 0 && <button onClick={() => runSimulation(clone(lastRunRef.current || config), clone(lastRunFilesRef.current || agentFiles))}>↻ 重新生成</button>}
               <button disabled={busy && status !== "paused"} onClick={reset}>重置</button>
             </div>
             <div className="run-summary"><span>输入 <b>{totalStats.input}</b></span><span>输出 <b>{totalStats.output}</b></span><span>估算成本 <b>{money(totalStats.cost)}</b></span></div>
@@ -696,13 +820,13 @@ export default function DemoApp() {
       </section>
 
       <section className="agents-grid">
-        <AgentPanel role="investor" config={config} onConfig={persistConfig} memory={investorMemory} onMemory={setInvestorMemory} promptPreview={() => setPromptModal({ title: "投资人 Agent · 当前最终组合提示词", content: composePrompt(config.investor, config.settings) })} />
-        <AgentPanel role="founder" config={config} onConfig={persistConfig} memory={founderMemory} onMemory={setFounderMemory} promptPreview={() => setPromptModal({ title: "创业者 Agent · 当前最终组合提示词", content: composePrompt(config.founder, config.settings) })} />
+        <AgentPanel role="investor" config={config} onConfig={persistConfig} memory={investorMemory} onMemory={setInvestorMemory} files={agentFiles.investor} filesDisabled={busy} onFilesChange={(files) => setAgentFiles((current) => ({ ...current, investor: files }))} promptPreview={() => setPromptModal({ title: "投资人 Agent · 当前最终组合提示词", content: composePrompt(config.investor, config.settings) })} />
+        <AgentPanel role="founder" config={config} onConfig={persistConfig} memory={founderMemory} onMemory={setFounderMemory} files={agentFiles.founder} filesDisabled={busy} onFilesChange={(files) => setAgentFiles((current) => ({ ...current, founder: files }))} promptPreview={() => setPromptModal({ title: "创业者 Agent · 当前最终组合提示词", content: composePrompt(config.founder, config.settings) })} />
       </section>
 
       {promptModal && <div className="modal-backdrop" onMouseDown={() => setPromptModal(null)}><section className="modal prompt-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>实际请求预览</p><h2>{promptModal.title}</h2></div><button onClick={() => setPromptModal(null)}>×</button></div><pre>{promptModal.content}</pre><div className="modal-foot"><span>{promptModal.content.length} 字符 · ≈{tokenEstimate(promptModal.content)} tokens</span><button onClick={() => { copyText(promptModal.content); setToast("已复制完整提示词"); }}>复制完整提示词</button></div></section></div>}
 
-      {versionOpen && <div className="modal-backdrop" onMouseDown={() => setVersionOpen(false)}><section className="modal list-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>LOCAL VERSIONS</p><h2>配置版本</h2></div><button onClick={() => setVersionOpen(false)}>×</button></div><button className="primary" onClick={saveVersion}>＋ 保存当前配置</button><div className="saved-list">{versions.length ? versions.map((version) => <article key={version.id}><div><strong>{version.name}</strong><span>{new Date(version.createdAt).toLocaleString("zh-CN")}</span></div><div><button onClick={() => { setConfig(clone(version.config)); setActiveVersion(version.id); setVersionOpen(false); setToast("版本已加载"); }}>加载</button><button onClick={() => downloadJson(`${version.name}.json`, version.config)}>导出</button><button className="danger-text" onClick={() => setVersions((current) => current.filter((item) => item.id !== version.id))}>删除</button></div></article>) : <div className="empty-panel">还没有保存版本</div>}</div></section></div>}
+      {versionOpen && <div className="modal-backdrop" onMouseDown={() => setVersionOpen(false)}><section className="modal list-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>LOCAL VERSIONS</p><h2>配置版本</h2></div><button onClick={() => setVersionOpen(false)}>×</button></div><button className="primary" onClick={saveVersion}>＋ 保存当前配置</button><div className="saved-list">{versions.length ? versions.map((version) => <article key={version.id}><div><strong>{version.name}</strong><span>{new Date(version.createdAt).toLocaleString("zh-CN")}</span></div><div><button onClick={() => { setConfig(migrateConfig(version.config)); setActiveVersion(version.id); setVersionOpen(false); setToast("版本已加载"); }}>加载</button><button onClick={() => downloadJson(`${version.name}.json`, version.config)}>导出</button><button className="danger-text" onClick={() => setVersions((current) => current.filter((item) => item.id !== version.id))}>删除</button></div></article>) : <div className="empty-panel">还没有保存版本</div>}</div></section></div>}
 
       {recordsOpen && <div className="modal-backdrop" onMouseDown={() => setRecordsOpen(false)}><section className="modal records-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>LOCAL RUN HISTORY</p><h2>最近模拟记录</h2></div><button onClick={() => setRecordsOpen(false)}>×</button></div><div className="saved-list">{records.length ? records.map((record) => <article key={record.conversationId}><div><strong>{record.configSnapshot.investor.fields.agentName} × {record.configSnapshot.founder.fields.agentName}</strong><span>{new Date(record.createdAt).toLocaleString("zh-CN")} · {record.messages.length} 条消息 · {record.endReason}</span><code>{record.conversationId}</code></div><div><button onClick={() => loadRecord(record)}>查看</button><button onClick={() => downloadJson(`${record.conversationId}.json`, record)}>导出</button></div></article>) : <div className="empty-panel">还没有模拟记录</div>}</div></section></div>}
 

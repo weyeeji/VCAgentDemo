@@ -91,6 +91,40 @@ export interface DebugCall {
   estimatedCost: number;
   success: boolean;
   error: string | null;
+  toolCalls?: ToolExecutionTrace[];
+}
+
+export interface AgentFileRecord {
+  id: string;
+  agentRole: AgentRole;
+  originalName: string;
+  mimeType: string;
+  size: number;
+  sha256: string;
+  status: "processing" | "ready" | "error";
+  error: string | null;
+  extractedChars: number;
+  chunkCount: number;
+  createdAt: string;
+}
+
+export interface FileSearchResult {
+  fileId: string;
+  fileName: string;
+  chunkId: string;
+  location: string;
+  content: string;
+  score: number;
+}
+
+export interface ToolExecutionTrace {
+  tool: "search_private_files";
+  agentRole: AgentRole;
+  query: string;
+  topK: number;
+  durationMs: number;
+  results: FileSearchResult[];
+  error: string | null;
 }
 
 export interface SimulationRecord {
@@ -100,6 +134,7 @@ export interface SimulationRecord {
   configVersion: string | null;
   configSnapshot: AppConfig;
   promptSnapshots: { investor: string; founder: string };
+  fileSnapshots: Record<AgentRole, AgentFileRecord[]>;
   messages: TurnMessage[];
   results: {
     public: unknown | null;

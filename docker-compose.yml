@@ -1,0 +1,16 @@
+services:
+  venture-agent-debugger:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /app/data
+    ports:
+      - "3000:3000"
+    volumes:
+      - venture-agent-data:/app/data
+
+volumes:
+  venture-agent-data:

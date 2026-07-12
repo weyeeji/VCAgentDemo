@@ -10,6 +10,7 @@ import {
   composeMemoryPrompt,
   composePrompt,
   deepCloneConfig,
+  deepCloneUserProfiles,
   defaultLayer,
   buildAgentCard,
   formatPeerAgentCardMessage,
@@ -35,6 +36,8 @@ import type {
   TurnControl,
   TurnMessage,
   ToolExecutionTrace,
+  UserProfileLibrary,
+  UserProfileRecord,
   WorkspaceState,
   WorkspaceStatePatch,
 } from "@/lib/types";
@@ -43,7 +46,7 @@ const LEGACY_CONFIG_KEY = "vc-agent-debugger:config:v1";
 const LEGACY_VERSION_KEY = "vc-agent-debugger:versions:v1";
 const LEGACY_RECORD_KEY = "vc-agent-debugger:records:v1";
 const LEGACY_STORAGE_KEYS = [LEGACY_CONFIG_KEY, LEGACY_VERSION_KEY, LEGACY_RECORD_KEY] as const;
-const WORKSPACE_PATCH_KEYS = ["config", "versions", "records", "memories", "dailyReports", "directChats", "activeVersion", "activeRecordId"] as const;
+const WORKSPACE_PATCH_KEYS = ["config", "profiles", "versions", "records", "memories", "dailyReports", "directChats", "activeVersion", "activeRecordId"] as const;
 const ROLE_LABEL: Record<AgentRole, string> = { investor: "投资人", founder: "创业者" };
 
 type RunStatus = "idle" | "running" | "paused" | "stopping" | "postprocessing" | "completed" | "error";
@@ -59,6 +62,79 @@ function emptyDirectChats(): DirectChatState {
     investor: { activeThreadId: null, threads: [] },
     founder: { activeThreadId: null, threads: [] },
   };
+}
+
+function activeUserProfile(library: UserProfileLibrary, config: AppConfig, role: AgentRole): UserProfileRecord {
+  return library[role].find((profile) => profile.id === config[role].id) || library[role][0];
+}
+
+function userProfileFromAgent(
+  agent: AgentProfile,
+  name: string,
+  kind: UserProfileRecord["kind"],
+  memory: unknown | null = null,
+  dailyReport: unknown | null = null,
+  fileIds: string[] = [],
+): UserProfileRecord {
+  const now = new Date().toISOString();
+  return {
+    id: agent.id,
+    role: agent.role,
+    name: name.trim().slice(0, 200) || agent.fields.agentName || `${ROLE_LABEL[agent.role]}资料`,
+    kind,
+    fields: clone(agent.fields),
+    dynamicLayer: clone(agent.prompts.dynamic),
+    fileIds: [...new Set(fileIds)].slice(0, 20),
+    memory: clone(memory),
+    dailyReport: clone(dailyReport),
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function syncProfilesWithConfig(
+  library: UserProfileLibrary,
+  config: AppConfig,
+  memories: Record<AgentRole, unknown | null>,
+  reports: Record<AgentRole, unknown | null>,
+): UserProfileLibrary {
+  const next = clone(library);
+  (["investor", "founder"] as AgentRole[]).forEach((role) => {
+    const index = next[role].findIndex((profile) => profile.id === config[role].id);
+    if (index >= 0) return;
+    const profile = userProfileFromAgent(
+      config[role],
+      `已恢复 · ${config[role].fields.agentName || ROLE_LABEL[role]}`,
+      "custom",
+      memories[role],
+      reports[role],
+    );
+    next[role] = [profile, ...next[role]].slice(0, 20);
+  });
+  return next;
+}
+
+function migrateLegacyProfiles(
+  library: UserProfileLibrary,
+  config: AppConfig,
+  memories: Record<AgentRole, unknown | null>,
+  reports: Record<AgentRole, unknown | null>,
+): UserProfileLibrary {
+  const next = syncProfilesWithConfig(library, config, memories, reports);
+  const now = new Date().toISOString();
+  (["investor", "founder"] as AgentRole[]).forEach((role) => {
+    const index = next[role].findIndex((profile) => profile.id === config[role].id);
+    if (index < 0) return;
+    next[role][index] = {
+      ...next[role][index],
+      fields: clone(config[role].fields),
+      dynamicLayer: clone(config[role].prompts.dynamic),
+      memory: clone(memories[role]),
+      dailyReport: clone(reports[role]),
+      updatedAt: now,
+    };
+  });
+  return next;
 }
 
 function id(prefix: string) {
@@ -101,12 +177,15 @@ function normalizeLegacyVersions(value: unknown): { items: SavedVersion[]; disca
   if (!Array.isArray(value)) throw new Error("旧配置版本不是数组");
   const items = value.flatMap((candidate) => {
     if (!isPlainObject(candidate)
-      || typeof candidate.id !== "string" || candidate.id.length > 200
-      || typeof candidate.name !== "string" || candidate.name.length > 200
+      || typeof candidate.id !== "string" || !candidate.id.trim() || candidate.id.length > 200 || candidate.id.includes("\0")
+      || typeof candidate.name !== "string" || !candidate.name.trim() || candidate.name.length > 200 || candidate.name.includes("\0")
       || typeof candidate.createdAt !== "string"
       || !isConfigCandidate(candidate.config)) return [];
     try {
-      return [{ id: candidate.id, name: candidate.name, createdAt: candidate.createdAt, config: migrateConfig(candidate.config) }];
+      const createdAt = Number.isFinite(Date.parse(candidate.createdAt)) && new Date(Date.parse(candidate.createdAt)).toISOString() === candidate.createdAt
+        ? candidate.createdAt
+        : new Date().toISOString();
+      return [{ id: candidate.id.trim(), name: candidate.name.trim(), createdAt, config: migrateConfig(candidate.config) }];
     } catch {
       return [];
     }
@@ -218,6 +297,23 @@ function serializedWorkspaceState(state: WorkspaceState): Record<string, string>
   return Object.fromEntries(WORKSPACE_PATCH_KEYS.map((key) => [key, JSON.stringify(stateRecord[key])]));
 }
 
+function normalizedVariants(value: unknown, label: string): PromptVariant[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.flatMap((candidate, index) => {
+    if (!isPlainObject(candidate) || typeof candidate.content !== "string") return [];
+    let variantId = typeof candidate.id === "string" ? candidate.id.trim().slice(0, 200) : "";
+    if (!variantId || variantId.includes("\0") || seen.has(variantId)) variantId = `variant-${crypto.randomUUID()}`;
+    seen.add(variantId);
+    const rawName = typeof candidate.name === "string" ? candidate.name.trim().slice(0, 200) : "";
+    const rawCreatedAt = typeof candidate.createdAt === "string" ? candidate.createdAt : "";
+    const createdAt = Number.isFinite(Date.parse(rawCreatedAt)) && new Date(Date.parse(rawCreatedAt)).toISOString() === rawCreatedAt
+      ? rawCreatedAt
+      : new Date().toISOString();
+    return [{ id: variantId, name: rawName || `${label} ${index + 1}`, content: candidate.content.slice(0, 200_000), createdAt }];
+  }).slice(0, 100);
+}
+
 function migrateConfig(value: AppConfig): AppConfig {
   const migrated = clone(value);
   const rawSettings: Record<string, unknown> = isPlainObject(migrated.settings) ? migrated.settings : {};
@@ -234,21 +330,24 @@ function migrateConfig(value: AppConfig): AppConfig {
   };
   (["investor", "founder"] as AgentRole[]).forEach((role) => {
     if (!migrated[role]?.prompts || !migrated[role]?.fields) migrated[role] = clone(DEFAULT_CONFIG[role]);
-    migrated[role].id = typeof migrated[role].id === "string" ? migrated[role].id : DEFAULT_CONFIG[role].id;
+    migrated[role].id = typeof migrated[role].id === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(migrated[role].id)
+      ? migrated[role].id
+      : DEFAULT_CONFIG[role].id;
     migrated[role].role = role;
-    migrated[role].fields = Object.fromEntries(Object.entries(migrated[role].fields).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+    migrated[role].fields = Object.fromEntries(Object.entries(migrated[role].fields)
+      .filter((entry): entry is [string, string] => /^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(entry[0]) && typeof entry[1] === "string")
+      .slice(0, 100)
+      .map(([key, fieldValue]) => [key, fieldValue.replaceAll("\0", "").slice(0, 20_000)]));
     (Object.keys(LAYER_LABELS) as LayerKey[]).forEach((key) => {
       const fallback = DEFAULT_CONFIG[role].prompts[key];
       const layer = migrated[role].prompts[key];
-      if (!layer || typeof layer !== "object") migrated[role].prompts[key] = clone(fallback);
-      else {
-        if (typeof layer.enabled !== "boolean") layer.enabled = fallback.enabled;
-        if (typeof layer.content !== "string") layer.content = fallback.content;
-        if (!Array.isArray(layer.variants)) layer.variants = [];
-        else layer.variants = layer.variants.filter((variant) => isPlainObject(variant)
-          && typeof variant.id === "string" && typeof variant.name === "string"
-          && typeof variant.content === "string" && typeof variant.createdAt === "string");
-      }
+      migrated[role].prompts[key] = !layer || typeof layer !== "object"
+        ? clone(fallback)
+        : {
+          enabled: typeof layer.enabled === "boolean" ? layer.enabled : fallback.enabled,
+          content: (typeof layer.content === "string" ? layer.content : fallback.content).slice(0, 200_000),
+          variants: normalizedVariants(layer.variants, `${LAYER_LABELS[key]}版本`),
+        };
     });
     const toolLayer = migrated[role].prompts.tools;
     const isLegacyToolPrompt = (content: string) => content.startsWith("当前版本没有可用的外部工具。不得虚构已查询数据库");
@@ -273,14 +372,21 @@ function migrateConfig(value: AppConfig): AppConfig {
   });
   if (typeof migrated.evaluatorPrompt !== "string" || !migrated.evaluatorPrompt) migrated.evaluatorPrompt = DEFAULT_CONFIG.evaluatorPrompt;
   else if (migrated.evaluatorPrompt.includes("双方公开资料")) migrated.evaluatorPrompt = migrated.evaluatorPrompt.replaceAll("双方公开资料", "双方用户层资料");
+  migrated.evaluatorPrompt = migrated.evaluatorPrompt.slice(0, 200_000);
   if (!migrated.memoryPrompts || typeof migrated.memoryPrompts !== "object") migrated.memoryPrompts = clone(DEFAULT_CONFIG.memoryPrompts);
   if (typeof migrated.jsonRepairPrompt !== "string" || !migrated.jsonRepairPrompt) migrated.jsonRepairPrompt = DEFAULT_CONFIG.jsonRepairPrompt;
+  migrated.jsonRepairPrompt = migrated.jsonRepairPrompt.slice(0, 200_000);
   if (!migrated.dailyReport || typeof migrated.dailyReport !== "object") migrated.dailyReport = clone(DEFAULT_CONFIG.dailyReport);
   (["investor", "founder"] as AgentRole[]).forEach((role) => {
     if (typeof migrated.memoryPrompts[role] !== "string" || !migrated.memoryPrompts[role]) migrated.memoryPrompts[role] = DEFAULT_CONFIG.memoryPrompts[role];
+    migrated.memoryPrompts[role] = migrated.memoryPrompts[role].slice(0, 200_000);
     migrated.dailyReport[role] = { ...clone(DEFAULT_CONFIG.dailyReport[role]), ...(migrated.dailyReport[role] || {}) };
-    if (!Array.isArray(migrated.dailyReport[role].taskVariants)) migrated.dailyReport[role].taskVariants = [];
-    if (!Array.isArray(migrated.dailyReport[role].dynamicVariants)) migrated.dailyReport[role].dynamicVariants = [];
+    const daily = migrated.dailyReport[role];
+    daily.taskPrompt = typeof daily.taskPrompt === "string" ? daily.taskPrompt.slice(0, 200_000) : DEFAULT_CONFIG.dailyReport[role].taskPrompt;
+    daily.dynamicPrompt = typeof daily.dynamicPrompt === "string" ? daily.dynamicPrompt.slice(0, 200_000) : DEFAULT_CONFIG.dailyReport[role].dynamicPrompt;
+    daily.taskVariants = normalizedVariants(daily.taskVariants, "日报任务层版本");
+    daily.dynamicVariants = normalizedVariants(daily.dynamicVariants, "日报动态层版本");
+    daily.maxTokens = Math.min(16_000, Math.max(64, Math.round(finiteNumber(daily.maxTokens, DEFAULT_CONFIG.dailyReport[role].maxTokens))));
   });
   return migrated;
 }
@@ -591,7 +697,7 @@ function DirectChatPanel({ role, state, busy, disabled, error, onNew, onSelect, 
 
   return <section className="agent-module test-chat-module">
     <div className="direct-chat-head">
-      <div><span className="visibility-badge private">用户测试 · 不限轮次</span><strong>与{ROLE_LABEL[role]} Agent 对话</strong><em>沿用创建会话时冻结的五层提示词、公开对方 Card 与私有文件工具</em></div>
+      <div><span className="visibility-badge private">用户测试 · 不限轮次</span><strong>与自己的{ROLE_LABEL[role]} Agent 对话</strong><em>沿用创建会话时冻结的本 Agent 五层提示词与本方私有文件工具</em></div>
       <button disabled={disabled || busy} onClick={onNew}>＋ 创建新对话</button>
     </div>
     {state.threads.length > 0 && <div className="direct-chat-history">
@@ -631,17 +737,17 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
   role: AgentRole;
   files: AgentFileRecord[];
   disabled: boolean;
-  onFilesChange: (files: AgentFileRecord[]) => void;
+  onFilesChange: (files: AgentFileRecord[], uploadedIds?: string[]) => void;
 }) {
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
-  async function refresh() {
+  async function refresh(uploadedIds: string[] = []) {
     const response = await fetch(`/api/files?role=${role}`, { cache: "no-store" });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "读取文件列表失败");
-    onFilesChange(data.files || []);
+    onFilesChange(data.files || [], uploadedIds);
   }
 
   async function upload(selected: FileList | null) {
@@ -654,7 +760,8 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
       const response = await fetch("/api/files", { method: "POST", body: form });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "上传失败");
-      await refresh();
+      const uploadedIds = Array.isArray(data.files) ? data.files.flatMap((file: unknown) => isPlainObject(file) && typeof file.id === "string" ? [file.id] : []) : [];
+      await refresh(uploadedIds);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "上传失败");
     } finally {
@@ -677,12 +784,12 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
   }
 
   return <details open className="agent-files-section">
-    <summary><div><span>私有文件库</span><em>仅{ROLE_LABEL[role]} Agent 可检索</em></div><b>{files.filter((file) => file.status === "ready").length} / 20</b></summary>
+    <summary><div><span>当前资料的私有文件</span><em>仅这套{ROLE_LABEL[role]}资料可检索</em></div><b>{files.filter((file) => file.status === "ready").length} 个</b></summary>
     <div className="agent-files-body">
       <label className={`file-drop ${disabled || working ? "disabled" : ""}`}>
         <input ref={inputRef} type="file" multiple accept=".pdf,.docx,.txt,.md,.markdown,.csv" disabled={disabled || working} onChange={(event) => upload(event.target.files)} />
         <span>{working ? "正在解析并建立索引…" : "＋ 上传 PDF、DOCX、TXT、Markdown 或 CSV"}</span>
-        <small>单文件 ≤ 10MB · 每次最多 5 个 · 文件持久化在服务器 data/ 目录</small>
+        <small>单文件 ≤ 10MB · 每次最多 5 个 · 每个角色合计最多 20 个 · 自动关联当前资料</small>
       </label>
       {disabled && <div className="files-run-note">模拟运行期间文件快照已冻结，结束后可继续上传或删除。</div>}
       {error && <div className="inline-error">{error}</div>}
@@ -700,7 +807,7 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
 
 function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, files, filesDisabled, onFilesChange,
   chatState, chatBusy, chatDisabled, chatError, onNewChat, onSelectChat, onDeleteChat, onSendChat, onPreviewChatCall, onPreviewChatPrompt,
-  onProfileDirty, onProfileSaved,
+  profileOptions, onSelectProfile, onCreateProfile, onProfileDirty, onSaveProfile,
 }: {
   role: AgentRole;
   config: AppConfig;
@@ -710,7 +817,7 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
   promptPreview: () => void;
   files: AgentFileRecord[];
   filesDisabled: boolean;
-  onFilesChange: (files: AgentFileRecord[]) => void;
+  onFilesChange: (files: AgentFileRecord[], uploadedIds?: string[]) => void;
   chatState: DirectChatRoleState;
   chatBusy: boolean;
   chatDisabled: boolean;
@@ -721,8 +828,11 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
   onSendChat: (content: string) => Promise<boolean>;
   onPreviewChatCall: (call: DebugCall) => void;
   onPreviewChatPrompt: (thread: DirectChatThread) => void;
+  profileOptions: UserProfileRecord[];
+  onSelectProfile: (profileId: string) => void;
+  onCreateProfile: () => void;
   onProfileDirty: (role: AgentRole, dirty: boolean) => void;
-  onProfileSaved: (role: AgentRole) => void;
+  onSaveProfile: (fields: Record<string, string>) => void;
 }) {
   const agent = config[role];
   const [draftFields, setDraftFields] = useState<Record<string, string>>(() => clone(agent.fields));
@@ -737,12 +847,12 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
   const completion = requiredFields.length ? Math.round(requiredDone / requiredFields.length * 100) : 100;
   const dirty = JSON.stringify(draftFields) !== JSON.stringify(agent.fields);
   const card = buildAgentCard(agent);
+  const selectedProfile = profileOptions.find((profile) => profile.id === agent.id) || profileOptions[0];
   useEffect(() => { onProfileDirty(role, dirty); }, [dirty, onProfileDirty, role]);
   function update(agentValue: AgentProfile) { onConfig({ ...config, [role]: agentValue }); }
   const renderField = (field: FieldDefinition) => <QuestionnaireField key={field.key} definition={field} value={draftFields[field.key] || ""} onChange={(value) => setDraftFields((current) => ({ ...current, [field.key]: value }))} />;
   function saveProfile() {
-    update({ ...agent, fields: clone(draftFields) });
-    onProfileSaved(role);
+    onSaveProfile(clone(draftFields));
   }
   return (
     <section className={`agent-panel ${color}`}>
@@ -750,6 +860,12 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
         <div className={`agent-avatar ${color}`}>{role === "investor" ? "投" : "创"}</div>
         <div><p>{ROLE_LABEL[role]} AGENT</p><h2>{agent.fields.agentName}</h2></div>
         <button className="outline" onClick={promptPreview}>查看最终组合提示词</button>
+      </div>
+      <div className="profile-library-bar">
+        <div><strong>当前用户资料</strong><span>A-A / B-B 为匹配组合，交叉选择用于测试不匹配</span></div>
+        <label><select aria-label={`${ROLE_LABEL[role]}用户资料方案`} value={selectedProfile?.id || ""} disabled={dirty || filesDisabled} onChange={(event) => onSelectProfile(event.target.value)}>{profileOptions.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.kind === "preset" ? " · 预设" : " · 自定义"}</option>)}</select></label>
+        <button disabled={dirty || filesDisabled || profileOptions.length >= 20} onClick={onCreateProfile}>＋ 新增资料</button>
+        <span className={`profile-kind ${selectedProfile?.kind || "custom"}`}>{selectedProfile?.kind === "preset" ? "内置预设" : "自定义资料"}</span>
       </div>
       <AgentCardView role={role} card={card} />
       <section className="agent-module profile-module">
@@ -761,7 +877,7 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
         </div>
         <details open className="profile-section public-profile-section">
           <summary><span>公开身份资料 · Agent Card 白名单</span><span>{publicFields.filter((field) => draftFields[field.key]?.trim()).length} / {publicFields.length} 已填写</span></summary>
-          <div className="questionnaire-note">这些字段保存后会进入公开 Agent Card，并在建立对话时作为对方的未核验身份声明发送。初筛必问、内部判断、风险和详细数据不会进入卡片。</div>
+          <div className="questionnaire-note">这些字段保存后会进入公开 Agent Card，并只在双 Agent 模拟开始时作为对方的未核验身份声明发送；用户测试对话不会携带另一方 Card。初筛必问、内部判断、风险和详细数据不会进入卡片。</div>
           <div className="field-grid">{publicFields.map(renderField)}</div>
         </details>
         <details open className="profile-section private-profile-section">
@@ -779,7 +895,7 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
       <section className="agent-module files-module"><div className="module-heading"><div><strong>私有文件与工具</strong><span>详细材料由本 Agent 按问题检索，不公开给对方</span></div><span className="visibility-badge private">仅本 Agent</span></div><AgentFilePanel role={role} files={files} disabled={filesDisabled} onFilesChange={onFilesChange} /></section>
       <section className="agent-module prompts-module"><div className="module-heading"><div><strong>五层提示词</strong><span>动态层适合放不愿直接公开的限制与临时状态；不会进入 Agent Card</span></div><span>按固定顺序组合</span></div>{(Object.keys(LAYER_LABELS) as LayerKey[]).map((key) => <PromptLayerEditor key={key} role={role} layerKey={key} agent={agent} onChange={update} />)}</section>
       <section className="agent-module memory-module"><div className="module-heading"><div><strong>当前私有记忆</strong><span>不会发送给对方 Agent</span></div><span className="visibility-badge private">仅本 Agent</span></div><div className="private-memory"><JsonPanel title={`${ROLE_LABEL[role]}私有记忆`} value={memory} onChange={onMemory} disabled={filesDisabled} /></div></section>
-      <DirectChatPanel key={`${role}-${chatState.activeThreadId || "none"}`} role={role} state={chatState} busy={chatBusy} disabled={chatDisabled} error={chatError} onNew={onNewChat} onSelect={onSelectChat} onDelete={onDeleteChat} onSend={onSendChat} onPreviewCall={onPreviewChatCall} onPreviewPrompt={onPreviewChatPrompt} />
+      <DirectChatPanel key={`${role}-${agent.id}-${chatState.activeThreadId || "none"}`} role={role} state={chatState} busy={chatBusy} disabled={chatDisabled} error={chatError} onNew={onNewChat} onSelect={onSelectChat} onDelete={onDeleteChat} onSend={onSendChat} onPreviewCall={onPreviewChatCall} onPreviewPrompt={onPreviewChatPrompt} />
     </section>
   );
 }
@@ -831,10 +947,12 @@ export default function DemoApp() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("loading");
   const [saveConflict, setSaveConflict] = useState<string[]>([]);
   const [config, setConfig] = useState<AppConfig>(() => deepCloneConfig(DEFAULT_CONFIG));
+  const [profiles, setProfiles] = useState<UserProfileLibrary>(() => deepCloneUserProfiles());
   const [versions, setVersions] = useState<SavedVersion[]>([]);
   const [records, setRecords] = useState<SimulationRecord[]>([]);
   const [directChats, setDirectChats] = useState<DirectChatState>(() => emptyDirectChats());
   const [agentFiles, setAgentFiles] = useState<Record<AgentRole, AgentFileRecord[]>>({ investor: [], founder: [] });
+  const [agentFilesReady, setAgentFilesReady] = useState(false);
   const [activeVersion, setActiveVersion] = useState<string | null>(null);
   const [activeRecordId, setActiveRecordId] = useState<string | null>(null);
   const [tab, setTab] = useState<TopTab>("conversation");
@@ -873,10 +991,12 @@ export default function DemoApp() {
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const logoutInProgressRef = useRef(false);
   const profileDirtyRef = useRef<Record<AgentRole, boolean>>({ investor: false, founder: false });
+  const orphanFileMigrationDoneRef = useRef(false);
 
   const currentWorkspacePatch = useCallback((): WorkspaceStatePatch => {
     return {
       config,
+      profiles,
       versions,
       records: records.slice(0, 20),
       directChats,
@@ -885,11 +1005,13 @@ export default function DemoApp() {
       activeVersion,
       activeRecordId,
     };
-  }, [activeRecordId, activeVersion, config, dailyReports, directChats, founderMemory, investorMemory, records, versions]);
+  }, [activeRecordId, activeVersion, config, dailyReports, directChats, founderMemory, investorMemory, profiles, records, versions]);
 
   const renderedWorkspacePatch = currentWorkspacePatch();
   latestWorkspacePatchRef.current = renderedWorkspacePatch;
   latestWorkspaceSerializedRef.current = Object.fromEntries(Object.entries(renderedWorkspacePatch).map(([key, value]) => [key, JSON.stringify(value)]));
+  const workspacePersisted = saveStatus === "saved"
+    && WORKSPACE_PATCH_KEYS.every((key) => latestWorkspaceSerializedRef.current[key] === serverSnapshotRef.current[key]);
 
   const persistWorkspacePatch = useCallback(async function savePatch(patch: WorkspaceStatePatch, serialized: Record<string, string>, allowRebase = true): Promise<boolean> {
     const sentKeys = Object.keys(patch) as Array<keyof WorkspaceStatePatch>;
@@ -921,6 +1043,7 @@ export default function DemoApp() {
         // Only adopt a server slice if it has not changed locally since this
         // request began. New local edits stay dirty and are saved afterwards.
         if (safe.has("config")) { const value = migrateConfig(current.config); adoptServerSlice("config", value); setConfig(value); }
+        if (safe.has("profiles")) { const value = clone(current.profiles); adoptServerSlice("profiles", value); setProfiles(value); }
         if (safe.has("versions")) { adoptServerSlice("versions", current.versions); setVersions(current.versions); }
         if (safe.has("records")) { const value = current.records.slice(0, 20); adoptServerSlice("records", value); setRecords(value); }
         if (safe.has("directChats")) { const value = clone(current.directChats); adoptServerSlice("directChats", value); setDirectChats(value); }
@@ -1006,15 +1129,19 @@ export default function DemoApp() {
         if (legacyConfig || legacyVersions || legacyRecords) {
           const migratedRecords = legacyRecords || [];
           const latest = migratedRecords[0];
+          const migrationConfig = legacyConfig || migrateConfig(state.config);
+          const migrationMemories = {
+            investor: latest?.results.investorMemory ?? null,
+            founder: latest?.results.founderMemory ?? null,
+          };
+          const migrationReports = latest?.results.dailyReports ?? { investor: null, founder: null };
           const patch: WorkspaceStatePatch = {
-            config: legacyConfig || migrateConfig(state.config),
+            config: migrationConfig,
+            profiles: migrateLegacyProfiles(state.profiles || deepCloneUserProfiles(), migrationConfig, migrationMemories, migrationReports),
             versions: legacyVersions || [],
             records: migratedRecords,
-            memories: {
-              investor: latest?.results.investorMemory ?? null,
-              founder: latest?.results.founderMemory ?? null,
-            },
-            dailyReports: latest?.results.dailyReports ?? { investor: null, founder: null },
+            memories: migrationMemories,
+            dailyReports: migrationReports,
             activeVersion: latest?.configVersion ?? null,
             activeRecordId: latest?.conversationId ?? null,
           };
@@ -1030,7 +1157,7 @@ export default function DemoApp() {
       }
 
       if (cancelled) return;
-      const normalizedConfig = migrateConfig(state.config);
+      let normalizedConfig = migrateConfig(state.config);
       const normalizedVersions = normalizeLegacyVersions(state.versions);
       const normalizedRecords = normalizeLegacyRecords(state.records);
       const serverVersions = normalizedVersions.items;
@@ -1041,16 +1168,38 @@ export default function DemoApp() {
       const validActiveVersion = serverVersions.some((version) => version.id === state.activeVersion) ? state.activeVersion : null;
       const memories = state.memories || { investor: null, founder: null };
       const reports = state.dailyReports || { investor: null, founder: null };
+      const normalizedProfiles = syncProfilesWithConfig(state.profiles || deepCloneUserProfiles(), normalizedConfig, memories, reports);
+      normalizedConfig = clone(normalizedConfig);
+      (["investor", "founder"] as AgentRole[]).forEach((role) => {
+        const profile = activeUserProfile(normalizedProfiles, normalizedConfig, role);
+        normalizedConfig[role] = {
+          ...normalizedConfig[role],
+          id: profile.id,
+          fields: clone(profile.fields),
+          prompts: { ...normalizedConfig[role].prompts, dynamic: clone(profile.dynamicLayer) },
+        };
+      });
+      const activeInvestorProfile = activeUserProfile(normalizedProfiles, normalizedConfig, "investor");
+      const activeFounderProfile = activeUserProfile(normalizedProfiles, normalizedConfig, "founder");
+      const loadedDirectChats = clone(state.directChats || emptyDirectChats());
+      (["investor", "founder"] as AgentRole[]).forEach((role) => {
+        const currentId = loadedDirectChats[role].activeThreadId;
+        const currentThread = loadedDirectChats[role].threads.find((thread) => thread.id === currentId);
+        if (currentThread?.agentSnapshot.id !== normalizedConfig[role].id) {
+          loadedDirectChats[role].activeThreadId = loadedDirectChats[role].threads.find((thread) => thread.agentSnapshot.id === normalizedConfig[role].id)?.id || null;
+        }
+      });
 
       setConfig(normalizedConfig);
+      setProfiles(normalizedProfiles);
       setVersions(serverVersions);
       setRecords(serverRecords);
-      setDirectChats(clone(state.directChats || emptyDirectChats()));
+      setDirectChats(loadedDirectChats);
       setActiveVersion(validActiveVersion);
       setActiveRecordId(activeRecord?.conversationId || null);
-      setInvestorMemory(clone(memories.investor ?? null));
-      setFounderMemory(clone(memories.founder ?? null));
-      setDailyReports(clone(reports));
+      setInvestorMemory(clone(activeInvestorProfile.memory));
+      setFounderMemory(clone(activeFounderProfile.memory));
+      setDailyReports({ investor: clone(activeInvestorProfile.dailyReport), founder: clone(activeFounderProfile.dailyReport) });
       setMessages(activeRecord ? clone(activeRecord.messages) : []);
       setDebugCalls(activeRecord ? clone(activeRecord.debugCalls) : []);
       setPublicResult(activeRecord ? clone(activeRecord.results.public ?? null) : null);
@@ -1064,6 +1213,7 @@ export default function DemoApp() {
       }
       serverSnapshotRef.current = {
         config: JSON.stringify(state.config),
+        profiles: JSON.stringify(state.profiles || deepCloneUserProfiles()),
         versions: JSON.stringify(state.versions),
         records: JSON.stringify(state.records),
         directChats: JSON.stringify(state.directChats || emptyDirectChats()),
@@ -1129,14 +1279,47 @@ export default function DemoApp() {
 
   useEffect(() => {
     if (auth !== "signed-in") return;
+    setAgentFilesReady(false);
+    orphanFileMigrationDoneRef.current = false;
     fetch("/api/health").then((response) => response.json()).then(setApiState).catch(() => setApiState({ configured: false, missing: ["无法连接服务端"], model: null }));
     Promise.all((["investor", "founder"] as AgentRole[]).map(async (role) => {
       const response = await fetch(`/api/files?role=${role}`, { cache: "no-store" });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "读取文件列表失败");
       return [role, data.files || []] as const;
-    })).then((entries) => setAgentFiles(Object.fromEntries(entries) as Record<AgentRole, AgentFileRecord[]>)).catch((caught) => setErrors((current) => [...current, `文件库加载失败：${caught instanceof Error ? caught.message : String(caught)}`]));
+    })).then((entries) => {
+      setAgentFiles(Object.fromEntries(entries) as Record<AgentRole, AgentFileRecord[]>);
+      setAgentFilesReady(true);
+    }).catch((caught) => {
+      setAgentFilesReady(true);
+      setErrors((current) => [...current, `文件库加载失败：${caught instanceof Error ? caught.message : String(caught)}`]);
+    });
   }, [auth]);
+  useEffect(() => {
+    if (!workspaceReady || !agentFilesReady || orphanFileMigrationDoneRef.current) return;
+    orphanFileMigrationDoneRef.current = true;
+    setProfiles((current) => {
+      const next = clone(current);
+      let changed = false;
+      (["investor", "founder"] as AgentRole[]).forEach((role) => {
+        const assigned = new Set(next[role].flatMap((profile) => profile.fileIds));
+        const orphanIds = agentFiles[role].map((file) => file.id).filter((fileId) => !assigned.has(fileId));
+        if (!orphanIds.length) return;
+        // One-time legacy/recovery migration is deterministic: role-level files
+        // from older builds attach to preset A, never whichever profile happens
+        // to be selected when the page loads.
+        const index = next[role].findIndex((profile) => profile.id === DEFAULT_CONFIG[role].id);
+        if (index < 0) return;
+        next[role][index] = {
+          ...next[role][index],
+          fileIds: [...new Set([...next[role][index].fileIds, ...orphanIds])].slice(0, 20),
+          updatedAt: new Date().toISOString(),
+        };
+        changed = true;
+      });
+      return changed ? next : current;
+    });
+  }, [agentFiles, agentFilesReady, workspaceReady]);
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(""), 1800);
@@ -1152,6 +1335,160 @@ export default function DemoApp() {
 
   function persistConfig(next: AppConfig) { setConfig(next); }
 
+  function updateProfileById(role: AgentRole, profileId: string, update: Partial<UserProfileRecord>) {
+    setProfiles((current) => ({
+      ...current,
+      [role]: current[role].map((profile) => profile.id === profileId
+        ? { ...profile, ...clone(update), id: profile.id, role: profile.role, updatedAt: new Date().toISOString() }
+        : profile),
+    }));
+  }
+
+  function updateActiveProfile(role: AgentRole, update: Partial<UserProfileRecord>) {
+    updateProfileById(role, config[role].id, update);
+  }
+
+  function clearActiveRunViewForProfileChange() {
+    setMessages([]);
+    setDebugCalls([]);
+    setPublicResult(null);
+    setRawErrors({});
+    setErrors([]);
+    setStatus("idle");
+    setActiveRecordId(null);
+    lastRunRef.current = null;
+    lastRunFilesRef.current = null;
+    lastRunMemoriesRef.current = null;
+  }
+
+  function persistAgentConfig(role: AgentRole, next: AppConfig) {
+    setConfig(next);
+    const agent = next[role];
+    updateActiveProfile(role, { fields: clone(agent.fields), dynamicLayer: clone(agent.prompts.dynamic) });
+  }
+
+  function saveProfileFields(role: AgentRole, fields: Record<string, string>) {
+    const nextAgent = { ...config[role], fields: clone(fields) };
+    setConfig({ ...config, [role]: nextAgent });
+    updateActiveProfile(role, { fields: clone(fields), dynamicLayer: clone(nextAgent.prompts.dynamic) });
+    setRoleProfileDirty(role, false);
+    setToast(`${ROLE_LABEL[role]}资料已保存，用户层与 Agent Card 已同步`);
+  }
+
+  function selectUserProfile(role: AgentRole, profileId: string) {
+    if (profileDirtyRef.current[role]) { setToast(`请先保存或撤销${ROLE_LABEL[role]}资料草稿再切换`); return; }
+    if (dailyBusy || directChatBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) return;
+    const profile = profiles[role].find((item) => item.id === profileId);
+    if (!profile) return;
+    clearActiveRunViewForProfileChange();
+    const nextAgent: AgentProfile = {
+      ...config[role],
+      id: profile.id,
+      fields: clone(profile.fields),
+      prompts: { ...config[role].prompts, dynamic: clone(profile.dynamicLayer) },
+    };
+    setConfig({ ...config, [role]: nextAgent });
+    if (role === "investor") setInvestorMemory(clone(profile.memory));
+    else setFounderMemory(clone(profile.memory));
+    setDailyReports((current) => ({ ...current, [role]: clone(profile.dailyReport) }));
+    setDirectChats((current) => {
+      const latest = current[role].threads.find((thread) => thread.agentSnapshot.id === profile.id);
+      return { ...current, [role]: { ...current[role], activeThreadId: latest?.id || null } };
+    });
+    setDirectChatErrors((current) => ({ ...current, [role]: "" }));
+    setActiveVersion(null);
+    setToast(`已切换到${ROLE_LABEL[role]}资料“${profile.name}”`);
+  }
+
+  function createUserProfile(role: AgentRole) {
+    if (profileDirtyRef.current[role]) { setToast(`请先保存或撤销${ROLE_LABEL[role]}资料草稿再新增`); return; }
+    if (profiles[role].length >= 20) { setToast(`每个角色最多保留 20 套资料`); return; }
+    const customCount = profiles[role].filter((profile) => profile.kind === "custom").length;
+    const name = window.prompt(`新增${ROLE_LABEL[role]}资料名称`, `我的${ROLE_LABEL[role]}资料 ${customCount + 1}`)?.trim();
+    if (!name) return;
+    if (name.length > 80) { setToast("资料名称不能超过 80 个字符"); return; }
+    if (profiles[role].some((profile) => profile.name.toLocaleLowerCase() === name.toLocaleLowerCase())) { setToast("已有同名资料，请换一个名称"); return; }
+    const profileId = `${role}-custom-${crypto.randomUUID()}`;
+    const fields = Object.fromEntries(FIELD_DEFINITIONS[role].map((field) => [field.key, field.key === "agentName" ? name : ""]));
+    const agent: AgentProfile = {
+      ...config[role],
+      id: profileId,
+      fields,
+      prompts: { ...config[role].prompts, dynamic: { enabled: false, content: "", variants: [] } },
+    };
+    const profile = userProfileFromAgent(agent, name, "custom", null, null, []);
+    clearActiveRunViewForProfileChange();
+    setProfiles((current) => ({ ...current, [role]: [profile, ...current[role]] }));
+    setConfig({ ...config, [role]: agent });
+    if (role === "investor") setInvestorMemory(null);
+    else setFounderMemory(null);
+    setDailyReports((current) => ({ ...current, [role]: null }));
+    setDirectChats((current) => ({ ...current, [role]: { ...current[role], activeThreadId: null } }));
+    setActiveVersion(null);
+    setToast(`已创建空白${ROLE_LABEL[role]}资料；动态层、文件、记忆、日报和对话均为空`);
+  }
+
+  function handleAgentFilesChange(role: AgentRole, files: AgentFileRecord[], uploadedIds: string[] = []) {
+    setAgentFiles((current) => ({ ...current, [role]: clone(files) }));
+    const available = new Set(files.map((file) => file.id));
+    const activeId = config[role].id;
+    setProfiles((current) => ({
+      ...current,
+      [role]: current[role].map((profile) => {
+        const retained = profile.fileIds.filter((fileId) => available.has(fileId));
+        const fileIds = profile.id === activeId ? [...new Set([...retained, ...uploadedIds])].slice(0, 20) : retained;
+        return JSON.stringify(fileIds) === JSON.stringify(profile.fileIds)
+          ? profile
+          : { ...profile, fileIds, updatedAt: new Date().toISOString() };
+      }),
+    }));
+  }
+
+  function filesForCurrentProfile(role: AgentRole): AgentFileRecord[] {
+    const fileIds = new Set(activeUserProfile(profiles, config, role).fileIds);
+    return agentFiles[role].filter((file) => fileIds.has(file.id));
+  }
+
+  function currentProfileFileSnapshots(): Record<AgentRole, AgentFileRecord[]> {
+    return { investor: clone(filesForCurrentProfile("investor")), founder: clone(filesForCurrentProfile("founder")) };
+  }
+
+  function activateExternalConfig(source: AppConfig, sourceLabel: string): boolean {
+    if (dailyBusy || directChatBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) {
+      setToast(`请先结束当前模型任务，再${sourceLabel}`);
+      return false;
+    }
+    const nextConfig = migrateConfig(source);
+    const nextProfiles = clone(profiles);
+    const selected: Record<AgentRole, UserProfileRecord | null> = { investor: null, founder: null };
+    for (const role of ["investor", "founder"] as AgentRole[]) {
+      const agent = nextConfig[role];
+      const exact = nextProfiles[role].find((profile) => profile.id === agent.id
+        && JSON.stringify(profile.fields) === JSON.stringify(agent.fields)
+        && JSON.stringify(profile.dynamicLayer) === JSON.stringify(agent.prompts.dynamic));
+      if (exact) { selected[role] = exact; continue; }
+      if (nextProfiles[role].length >= 20) {
+        setToast(`${ROLE_LABEL[role]}资料已达 20 套，无法${sourceLabel}`);
+        return false;
+      }
+      agent.id = `${role}-custom-${crypto.randomUUID()}`;
+      const profile = userProfileFromAgent(agent, `${sourceLabel} · ${agent.fields.agentName || ROLE_LABEL[role]}`, "custom");
+      nextProfiles[role] = [profile, ...nextProfiles[role]];
+      selected[role] = profile;
+    }
+    clearActiveRunViewForProfileChange();
+    setProfiles(nextProfiles);
+    setConfig(nextConfig);
+    setInvestorMemory(clone(selected.investor?.memory ?? null));
+    setFounderMemory(clone(selected.founder?.memory ?? null));
+    setDailyReports({ investor: clone(selected.investor?.dailyReport ?? null), founder: clone(selected.founder?.dailyReport ?? null) });
+    setDirectChats((current) => ({
+      investor: { ...current.investor, activeThreadId: current.investor.threads.find((thread) => thread.agentSnapshot.id === nextConfig.investor.id)?.id || null },
+      founder: { ...current.founder, activeThreadId: current.founder.threads.find((thread) => thread.agentSnapshot.id === nextConfig.founder.id)?.id || null },
+    }));
+    return true;
+  }
+
   const setRoleProfileDirty = useCallback((role: AgentRole, dirty: boolean) => {
     profileDirtyRef.current = { ...profileDirtyRef.current, [role]: dirty };
     setProfileDirty(profileDirtyRef.current);
@@ -1159,18 +1496,21 @@ export default function DemoApp() {
 
   function updateStoredResult(kind: "public" | "investorMemory" | "founderMemory", value: unknown) {
     if (kind === "public") setPublicResult(value);
-    if (kind === "investorMemory") setInvestorMemory(value);
-    if (kind === "founderMemory") setFounderMemory(value);
+    if (kind === "investorMemory") { setInvestorMemory(value); updateActiveProfile("investor", { memory: clone(value) }); }
+    if (kind === "founderMemory") { setFounderMemory(value); updateActiveProfile("founder", { memory: clone(value) }); }
     if (!activeRecordId) return;
     setRecords((current) => current.map((record) => record.conversationId === activeRecordId
+      && (kind === "public" || record.configSnapshot[kind === "investorMemory" ? "investor" : "founder"].id === config[kind === "investorMemory" ? "investor" : "founder"].id)
       ? { ...record, results: { ...record.results, [kind]: clone(value) } }
       : record));
   }
 
   function updateStoredDailyReport(role: AgentRole, value: unknown) {
     setDailyReports((current) => ({ ...current, [role]: value }));
+    updateActiveProfile(role, { dailyReport: clone(value) });
     if (!activeRecordId) return;
     setRecords((current) => current.map((record) => record.conversationId === activeRecordId
+      && record.configSnapshot[role].id === config[role].id
       ? { ...record, results: { ...record.results, dailyReports: { ...record.results.dailyReports, [role]: clone(value) } } }
       : record));
   }
@@ -1233,6 +1573,7 @@ export default function DemoApp() {
           messages: params.messages,
           maxTokens: params.maxTokens,
           agentRole: params.agentRole,
+          profileId: params.agentRole ? params.snapshot[params.agentRole].id : undefined,
           fileIds: params.fileIds,
           toolsEnabled: params.toolsEnabled,
         }), signal: abortRef.current.signal,
@@ -1296,7 +1637,12 @@ export default function DemoApp() {
       const systemPrompt = isPublic ? snapshot.evaluatorPrompt : composeMemoryPrompt(snapshot, role);
       const actor = isPublic ? "evaluator" as const : role;
       const type: DebugCall["type"] = isPublic ? "public_evaluation" : role === "investor" ? "investor_memory" : "founder_memory";
-      const previousMemory = isPublic ? "" : `\n\n【更新前的${ROLE_LABEL[role]}私有记忆】\n${record.memorySnapshots[role] == null ? "（暂无，首次创建）" : JSON.stringify(record.memorySnapshots[role], null, 2)}`;
+      const storedMemory = record.memorySnapshots[role];
+      const expectedCounterpartyId = snapshot[otherRole(role)].id;
+      const previousMemoryValue = storedMemory != null && asRecord(storedMemory).counterparty_id === expectedCounterpartyId
+        ? storedMemory
+        : null;
+      const previousMemory = isPublic ? "" : `\n\n【更新前的${ROLE_LABEL[role]}私有记忆】\n${previousMemoryValue == null ? "（暂无；首次创建或本次对手资料已变化，不得合并其他主体的旧记忆）" : JSON.stringify(previousMemoryValue, null, 2)}`;
       const userContent = `${profileContext}${previousMemory}\n\n【完整对话】\n${transcript}\n\nconversation_id: ${record.conversationId}\ninvestor_agent_id: ${snapshot.investor.id}\nfounder_agent_id: ${snapshot.founder.id}\nconversation_end_reason: ${record.endReason || "unknown"}`;
       try {
         const response = await modelCall({ record, type, actor, round: null, systemPrompt,
@@ -1311,8 +1657,14 @@ export default function DemoApp() {
         const result = await parseWithRepair(response.raw, type, record, snapshot);
         record.results[kind] = result;
         if (kind === "public") setPublicResult(result);
-        if (kind === "investorMemory") setInvestorMemory(result);
-        if (kind === "founderMemory") setFounderMemory(result);
+        if (kind === "investorMemory") {
+          updateProfileById("investor", snapshot.investor.id, { memory: clone(result) });
+          if (config.investor.id === snapshot.investor.id) setInvestorMemory(result);
+        }
+        if (kind === "founderMemory") {
+          updateProfileById("founder", snapshot.founder.id, { memory: clone(result) });
+          if (config.founder.id === snapshot.founder.id) setFounderMemory(result);
+        }
         saveRecordProgress(record);
       } catch (caught: unknown) {
         const label = isPublic ? "公共结果" : role === "investor" ? "投资人记忆" : "创业者记忆";
@@ -1430,18 +1782,17 @@ export default function DemoApp() {
 
   async function generateDailyReport(role: AgentRole) {
     if (dailyBusy || directChatBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) return;
+    if (!workspacePersisted) { setToast("请等待当前资料保存到服务器后再生成日报"); return; }
     setDailyBusy(role);
     setErrors([]);
     const memory = role === "investor" ? investorMemory : founderMemory;
-    const storedRecord = activeRecordId ? records.find((record) => record.conversationId === activeRecordId) : null;
-    // When a daily report is attached to an existing simulation, start from
-    // that complete record so modelCall's progress save cannot erase it.
-    const scratch = storedRecord
-      ? clone(storedRecord)
-      : newRecord(clone(config), clone(agentFiles), { investor: clone(investorMemory), founder: clone(founderMemory) });
-    const targetRecordId = activeRecordId || id("daily");
+    const profileFiles = filesForCurrentProfile(role);
+    // A daily-report call is a new model run with its own current prompt and
+    // file snapshot. Keep it in a separate record instead of mutating a
+    // completed simulation whose provenance may no longer match.
+    const scratch = newRecord(clone(config), currentProfileFileSnapshots(), { investor: clone(investorMemory), founder: clone(founderMemory) });
+    const targetRecordId = id("daily");
     scratch.conversationId = targetRecordId;
-    if (!storedRecord) scratch.debugCalls = [];
     const systemPrompt = composeDailyPrompt(config, role, memory);
     let generated: unknown | undefined;
     let generationError: string | null = null;
@@ -1458,7 +1809,7 @@ export default function DemoApp() {
         maxTokens: config.dailyReport[role].maxTokens,
         snapshot: config,
         agentRole: role,
-        fileIds: agentFiles[role].filter((file) => file.status === "ready").map((file) => file.id),
+        fileIds: profileFiles.filter((file) => file.status === "ready").map((file) => file.id),
         toolsEnabled: config[role].prompts.tools.enabled,
         recordProgress: "merge-debug",
       });
@@ -1468,6 +1819,7 @@ export default function DemoApp() {
       generated = result;
       setDebugCalls(clone(scratch.debugCalls));
       setDailyReports((current) => ({ ...current, [role]: result }));
+      updateActiveProfile(role, { dailyReport: clone(result) });
       setToast(`${ROLE_LABEL[role]}日报已生成`);
     } catch (caught) {
       generationError = `${ROLE_LABEL[role]}日报生成失败：${caught instanceof Error ? caught.message : String(caught)}`;
@@ -1477,39 +1829,27 @@ export default function DemoApp() {
       if (!scratch.completedAt) scratch.completedAt = new Date().toISOString();
       scratch.results.dailyReports = { ...clone(dailyReports), ...(generated === undefined ? {} : { [role]: clone(generated) }) };
       scratch.errors = generationError ? [generationError] : [];
-      setRecords((current) => {
-        const existing = current.find((record) => record.conversationId === targetRecordId);
-        const saved = existing ? {
-          ...existing,
-          completedAt: scratch.completedAt,
-          results: generated === undefined ? existing.results : {
-            ...existing.results,
-            dailyReports: { ...(existing.results.dailyReports || { investor: null, founder: null }), [role]: clone(generated) },
-          },
-          debugCalls: clone(scratch.debugCalls),
-          errors: generationError ? [...existing.errors, generationError] : existing.errors,
-        } : clone(scratch);
-        return [saved, ...current.filter((record) => record.conversationId !== targetRecordId)].slice(0, 20);
-      });
-      if (!activeRecordId) {
-        setActiveRecordId(targetRecordId);
-        setStatus(generated === undefined ? "error" : "completed");
-      }
+      setRecords((current) => [clone(scratch), ...current.filter((record) => record.conversationId !== targetRecordId)].slice(0, 20));
+      setActiveRecordId(targetRecordId);
+      setStatus(generated === undefined ? "error" : "completed");
       setDailyBusy(null);
     }
   }
 
   function createDirectChat(role: AgentRole) {
     if (directChatBusy || dailyBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) return;
-    if (profileDirtyRef.current[role] || profileDirtyRef.current[otherRole(role)]) {
-      setToast("请先保存双方资料，再创建会话并冻结 Agent Card");
+    if (!workspacePersisted) { setToast("请等待当前资料保存到服务器后再创建对话"); return; }
+    if (profileDirtyRef.current[role]) {
+      setToast(`请先保存${ROLE_LABEL[role]}资料，再创建与自己 Agent 的测试对话`);
       return;
     }
     const currentRoleState = directChats[role];
     if (currentRoleState.threads.length >= 20) {
-      setToast("每个 Agent 最多保留 20 个用户对话；请先导出或清理旧工作区数据");
+      setToast("每个角色最多保留 20 个用户对话；请先删除旧对话");
       return;
     }
+    const profile = activeUserProfile(profiles, config, role);
+    const allowedFileIds = new Set(profile.fileIds);
     const now = new Date().toISOString();
     const thread: DirectChatThread = {
       id: id("direct"),
@@ -1520,8 +1860,7 @@ export default function DemoApp() {
       settingsSnapshot: clone(config.settings),
       promptSnapshot: composeDirectChatPrompt(config[role], config.settings),
       jsonRepairPromptSnapshot: config.jsonRepairPrompt,
-      counterpartyAgentCardSnapshot: buildAgentCard(config[otherRole(role)]),
-      fileSnapshots: clone(agentFiles[role]),
+      fileSnapshots: clone(agentFiles[role].filter((file) => allowedFileIds.has(file.id))),
       messages: [],
       debugCalls: [],
       errors: [],
@@ -1533,7 +1872,7 @@ export default function DemoApp() {
 
   function selectDirectChat(role: AgentRole, threadId: string) {
     if (directChatBusy) return;
-    setDirectChats((current) => current[role].threads.some((thread) => thread.id === threadId)
+    setDirectChats((current) => current[role].threads.some((thread) => thread.id === threadId && thread.agentSnapshot.id === config[role].id)
       ? { ...current, [role]: { ...current[role], activeThreadId: threadId } }
       : current);
     setDirectChatErrors((current) => ({ ...current, [role]: "" }));
@@ -1542,7 +1881,9 @@ export default function DemoApp() {
   function deleteDirectChat(role: AgentRole) {
     if (directChatBusy || dailyBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) return;
     const roleState = directChats[role];
-    const activeIndex = roleState.threads.findIndex((thread) => thread.id === roleState.activeThreadId);
+    const activeIndex = roleState.threads.findIndex((thread) => thread.id === roleState.activeThreadId && thread.agentSnapshot.id === config[role].id) >= 0
+      ? roleState.threads.findIndex((thread) => thread.id === roleState.activeThreadId)
+      : roleState.threads.findIndex((thread) => thread.agentSnapshot.id === config[role].id);
     if (activeIndex < 0) return;
     if (!window.confirm(`确定删除当前${ROLE_LABEL[role]}用户测试对话吗？对话消息与工具轨迹将一并删除。`)) return;
     const deletedId = roleState.threads[activeIndex].id;
@@ -1551,7 +1892,7 @@ export default function DemoApp() {
       const currentIndex = currentRoleState.threads.findIndex((thread) => thread.id === deletedId);
       if (currentIndex < 0) return current;
       const threads = currentRoleState.threads.filter((thread) => thread.id !== deletedId);
-      const activeThreadId = threads[currentIndex]?.id || threads[currentIndex - 1]?.id || null;
+      const activeThreadId = threads.find((thread) => thread.agentSnapshot.id === config[role].id)?.id || null;
       return { ...current, [role]: { activeThreadId, threads } };
     });
     setDirectChatErrors((current) => ({ ...current, [role]: "" }));
@@ -1561,7 +1902,8 @@ export default function DemoApp() {
   async function sendDirectChat(role: AgentRole, content: string): Promise<boolean> {
     if (directChatBusy || dailyBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) return false;
     const roleState = directChats[role];
-    const thread = roleState.threads.find((item) => item.id === roleState.activeThreadId);
+    const thread = roleState.threads.find((item) => item.id === roleState.activeThreadId && item.agentSnapshot.id === config[role].id)
+      || roleState.threads.find((item) => item.agentSnapshot.id === config[role].id);
     if (!thread) { setDirectChatErrors((current) => ({ ...current, [role]: "请先创建新对话。" })); return false; }
     const threadId = thread.id;
     const userMessage: DirectChatMessage = {
@@ -1573,7 +1915,6 @@ export default function DemoApp() {
     const omitted = history.length - recentHistory.length;
     const apiMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
       { role: "system", content: thread.promptSnapshot },
-      { role: "user", content: formatPeerAgentCardMessage(thread.counterpartyAgentCardSnapshot) },
       ...(omitted > 0 ? [{ role: "user" as const, content: `【上下文边界】当前请求仅携带最近 ${recentHistory.length} 条消息，更早的 ${omitted} 条没有进入本次模型上下文。不得猜测或声称记得未提供的早期内容。` }] : []),
       ...recentHistory.map((message) => ({ role: message.role, content: message.content })),
     ];
@@ -1598,7 +1939,7 @@ export default function DemoApp() {
         actor: role,
         round: null,
         systemPrompt: thread.promptSnapshot,
-        layerStates: { ...Object.fromEntries(Object.entries(thread.agentSnapshot.prompts).map(([key, layer]) => [key, key === "user" ? true : layer.enabled])), identity: true },
+        layerStates: Object.fromEntries(Object.entries(thread.agentSnapshot.prompts).map(([key, layer]) => [key, key === "user" ? true : layer.enabled])),
         profile: clone(thread.agentSnapshot.fields),
         messages: apiMessages,
         maxTokens: thread.settingsSnapshot.maxTokens,
@@ -1640,8 +1981,17 @@ export default function DemoApp() {
 
   function start() {
     if (dailyBusy || directChatBusy || ["running", "paused", "postprocessing"].includes(status)) return;
+    if (!workspacePersisted) { setToast("请等待当前资料保存到服务器后再开始模拟"); return; }
     if (Object.values(profileDirtyRef.current).some(Boolean)) { setToast("请先保存双方资料，再冻结 Agent Card 并开始模拟"); return; }
-    runSimulation(clone(config), clone(agentFiles), { investor: clone(investorMemory), founder: clone(founderMemory) });
+    runSimulation(clone(config), currentProfileFileSnapshots(), { investor: clone(investorMemory), founder: clone(founderMemory) });
+  }
+
+  function rerunLastSnapshot() {
+    if (modelBusy) return;
+    if (!workspacePersisted) { setToast("请等待当前工作区保存到服务器后再重新生成"); return; }
+    if (Object.values(profileDirtyRef.current).some(Boolean)) { setToast("请先保存或撤销双方资料草稿，再重新生成"); return; }
+    if (!lastRunRef.current || !lastRunFilesRef.current || !lastRunMemoriesRef.current) { setToast("没有可重新生成的完整快照"); return; }
+    runSimulation(clone(lastRunRef.current), clone(lastRunFilesRef.current), clone(lastRunMemoriesRef.current));
   }
 
   function stop() {
@@ -1658,6 +2008,7 @@ export default function DemoApp() {
   }
 
   function saveVersion() {
+    if (profileDraftsBlock("保存命名版本")) return;
     const name = window.prompt("为当前配置命名", `配置 ${versions.length + 1}`)?.trim();
     if (!name) return;
     const version: SavedVersion = { id: id("version"), name, createdAt: new Date().toISOString(), config: clone(config) };
@@ -1677,7 +2028,7 @@ export default function DemoApp() {
       try {
         const parsed = JSON.parse(String(reader.result));
         if (!isConfigCandidate(parsed)) throw new Error("配置结构无效或资料字段不是文本");
-        setConfig(migrateConfig(parsed)); setActiveVersion(null); setToast("配置已导入");
+        if (activateExternalConfig(parsed, "导入资料")) { setActiveVersion(null); setToast("配置已导入；资料库中没有的身份已保存为自定义资料"); }
       } catch (caught) { setToast(`导入失败：${caught instanceof Error ? caught.message : "格式错误"}`); }
     };
     reader.readAsText(file);
@@ -1685,7 +2036,7 @@ export default function DemoApp() {
 
   function loadVersion(version: SavedVersion) {
     if (profileDraftsBlock("加载命名版本")) return;
-    setConfig(migrateConfig(version.config));
+    if (!activateExternalConfig(version.config, `版本 ${version.name}`)) return;
     setActiveVersion(version.id);
     setVersionOpen(false);
     setToast("版本已加载");
@@ -1694,6 +2045,9 @@ export default function DemoApp() {
   function loadRecord(record: SimulationRecord) {
     setMessages(clone(record.messages)); setDebugCalls(clone(record.debugCalls)); setPublicResult(clone(record.results.public));
     setRawErrors(clone(record.results.rawErrors));
+    lastRunRef.current = clone(record.configSnapshot);
+    lastRunFilesRef.current = clone(record.fileSnapshots);
+    lastRunMemoriesRef.current = clone(record.memorySnapshots);
     setActiveRecordId(record.conversationId); setErrors(clone(record.errors)); setStatus("completed"); setRecordsOpen(false); setTab("conversation");
   }
 
@@ -1814,11 +2168,11 @@ export default function DemoApp() {
             </div>
             <details className="price-settings"><summary>成本估算单价</summary><label>输入 $ / 1M<input type="number" min={0} step="0.01" value={config.settings.inputPricePerMillion} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, inputPricePerMillion: Number(event.target.value) } })} /></label><label>输出 $ / 1M<input type="number" min={0} step="0.01" value={config.settings.outputPricePerMillion} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, outputPricePerMillion: Number(event.target.value) } })} /></label></details>
             <div className="run-buttons">
-              {!busy && <button className="primary" disabled={dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={start}>▶ 开始模拟</button>}
+              {!busy && <button className="primary" disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={start}>▶ 开始模拟</button>}
               {status === "running" && <button onClick={() => { pauseRef.current = true; setStatus("paused"); }}>Ⅱ 暂停</button>}
               {status === "paused" && <button className="primary" onClick={() => { pauseRef.current = false; setStatus("running"); }}>▶ 继续</button>}
               {busy && <button className="danger" onClick={stop}>■ 停止</button>}
-              {!busy && messages.length > 0 && <button onClick={() => runSimulation(clone(lastRunRef.current || config), clone(lastRunFilesRef.current || agentFiles), clone(lastRunMemoriesRef.current || { investor: investorMemory, founder: founderMemory }))}>↻ 按原快照重新生成</button>}
+              {!busy && messages.length > 0 && <button disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={rerunLastSnapshot}>↻ 按原快照重新生成</button>}
               <button disabled={dailyBusy !== null || directChatBusy !== null || (busy && status !== "paused")} onClick={reset}>重置</button>
             </div>
             <div className="run-summary"><span>输入 <b>{totalStats.input}</b></span><span>输出 <b>{totalStats.output}</b></span><span>估算成本 <b>{money(totalStats.cost)}</b></span></div>
@@ -1870,7 +2224,7 @@ export default function DemoApp() {
               const actual = [...debugCalls].reverse().find((call) => call.type === `${role}_daily_report`);
               const currentDailyPrompt = composeDailyPrompt(config, role, memory);
               return <section className={`daily-card ${role}`} key={role}>
-                <div className="daily-card-head"><div><span>{role === "investor" ? "投" : "创"}</span><div><strong>{ROLE_LABEL[role]} Agent 日报</strong><em>{memory ? "已注入当前私有记忆" : "当前无私有记忆，仍可测试空状态"}</em></div></div><button className="primary" disabled={dailyBusy !== null || busy || directChatBusy !== null} onClick={() => generateDailyReport(role)}>{dailyBusy === role ? "生成中…" : "生成日报"}</button></div>
+                <div className="daily-card-head"><div><span>{role === "investor" ? "投" : "创"}</span><div><strong>{ROLE_LABEL[role]} Agent 日报</strong><em>{memory ? "已注入当前资料的私有记忆" : "当前资料无私有记忆，仍可测试空状态"}</em></div></div><button className="primary" disabled={!workspacePersisted || dailyBusy !== null || busy || directChatBusy !== null} onClick={() => generateDailyReport(role)}>{dailyBusy === role ? "生成中…" : "生成日报"}</button></div>
                 <div className="daily-layer-map" aria-label={`${ROLE_LABEL[role]}日报五层提示词结构`}>
                   <span><b>1</b>平台层<em>复用</em></span><i />
                   <span><b>2</b>工具层<em>复用</em></span><i />
@@ -1902,30 +2256,43 @@ export default function DemoApp() {
       </section>
 
       <section className="agents-grid">
-        {(["investor", "founder"] as AgentRole[]).map((role) => <AgentPanel
-          key={`${role}-${profileFieldsKey(config[role].fields)}`}
+        {(["investor", "founder"] as AgentRole[]).map((role) => {
+          const profile = activeUserProfile(profiles, config, role);
+          const fileIds = new Set(profile.fileIds);
+          const profileFiles = agentFiles[role].filter((file) => fileIds.has(file.id));
+          const profileThreads = directChats[role].threads.filter((thread) => thread.agentSnapshot.id === profile.id);
+          const profileChatState: DirectChatRoleState = {
+            activeThreadId: profileThreads.some((thread) => thread.id === directChats[role].activeThreadId) ? directChats[role].activeThreadId : profileThreads[0]?.id || null,
+            threads: profileThreads,
+          };
+          return <AgentPanel
+          key={`${role}-${config[role].id}-${profileFieldsKey(config[role].fields)}`}
           role={role}
           config={config}
-          onConfig={persistConfig}
+          onConfig={(next) => persistAgentConfig(role, next)}
           memory={role === "investor" ? investorMemory : founderMemory}
           onMemory={(value) => updateStoredResult(role === "investor" ? "investorMemory" : "founderMemory", value)}
-          files={agentFiles[role]}
-          filesDisabled={modelBusy}
-          onFilesChange={(files) => setAgentFiles((current) => ({ ...current, [role]: files }))}
+          files={profileFiles}
+          filesDisabled={modelBusy || !workspacePersisted}
+          onFilesChange={(files, uploadedIds) => handleAgentFilesChange(role, files, uploadedIds)}
           promptPreview={() => setPromptModal({ title: `${ROLE_LABEL[role]} Agent · 当前最终组合提示词`, content: composePrompt(config[role], config.settings) })}
-          chatState={directChats[role]}
+          chatState={profileChatState}
           chatBusy={directChatBusy === role}
-          chatDisabled={busy || dailyBusy !== null || (directChatBusy !== null && directChatBusy !== role)}
+          chatDisabled={!workspacePersisted || busy || dailyBusy !== null || (directChatBusy !== null && directChatBusy !== role)}
           chatError={directChatErrors[role]}
           onNewChat={() => createDirectChat(role)}
           onSelectChat={(threadId) => selectDirectChat(role, threadId)}
           onDeleteChat={() => deleteDirectChat(role)}
           onSendChat={(content) => sendDirectChat(role, content)}
           onPreviewChatCall={(call) => setPromptModal({ title: `${ROLE_LABEL[role]}用户测试对话 · 本次实际完整请求与工具轨迹`, content: `${formatModelRequest(call.messages)}\n\n【工具调用轨迹】\n${JSON.stringify(call.toolCalls || [], null, 2)}` })}
-          onPreviewChatPrompt={(thread) => setPromptModal({ title: `${ROLE_LABEL[role]}用户测试对话 · 创建时冻结的完整上下文`, content: formatModelRequest([{ role: "system", content: thread.promptSnapshot }, { role: "user", content: formatPeerAgentCardMessage(thread.counterpartyAgentCardSnapshot) }]) })}
+          onPreviewChatPrompt={(thread) => setPromptModal({ title: `${ROLE_LABEL[role]}用户测试对话 · 创建时冻结的本 Agent 完整提示词`, content: formatModelRequest([{ role: "system", content: thread.promptSnapshot }]) })}
+          profileOptions={profiles[role]}
+          onSelectProfile={(profileId) => selectUserProfile(role, profileId)}
+          onCreateProfile={() => createUserProfile(role)}
           onProfileDirty={setRoleProfileDirty}
-          onProfileSaved={(savedRole) => { setRoleProfileDirty(savedRole, false); setToast(`${ROLE_LABEL[savedRole]}资料已保存，Agent Card 已同步`); }}
-        />)}
+          onSaveProfile={(fields) => saveProfileFields(role, fields)}
+        />;
+        })}
       </section>
 
       {promptModal && <div className="modal-backdrop" onMouseDown={() => setPromptModal(null)}><section className="modal prompt-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>实际请求预览</p><h2>{promptModal.title}</h2></div><button onClick={() => setPromptModal(null)}>×</button></div><pre>{promptModal.content}</pre><div className="modal-foot"><span>{promptModal.content.length} 字符 · ≈{tokenEstimate(promptModal.content)} tokens</span><button onClick={() => { copyText(promptModal.content); setToast("已复制完整提示词"); }}>复制完整提示词</button></div></section></div>}

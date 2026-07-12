@@ -2,10 +2,17 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
-import { buildCanonicalAgentCard, DEFAULT_CONFIG, deepCloneConfig, isAgentCardField } from "./defaults";
+import {
+  buildCanonicalAgentCard,
+  DEFAULT_CONFIG,
+  deepCloneConfig,
+  deepCloneUserProfiles,
+  isAgentCardField,
+} from "./defaults";
 import type {
   AgentFileRecord,
   AgentProfile,
+  AgentRole,
   AppConfig,
   DebugCall,
   DemoAgentCard,
@@ -13,10 +20,13 @@ import type {
   DirectChatRoleState,
   DirectChatState,
   DirectChatThread,
+  PromptLayer,
   RunSettings,
   SavedVersion,
   SimulationRecord,
   ToolExecutionTrace,
+  UserProfileLibrary,
+  UserProfileRecord,
   WorkspaceState,
   WorkspaceStatePatch,
 } from "./types";
@@ -27,6 +37,11 @@ const MAX_STATE_CHARS = 24_000_000;
 const MAX_VERSIONS = 100;
 const MAX_RECORDS = 20;
 const MAX_DIRECT_CHAT_THREADS_PER_ROLE = 20;
+const MAX_USER_PROFILES_PER_ROLE = 20;
+const MAX_PROFILE_FIELDS = 100;
+const MAX_PROFILE_FIELD_VALUE_CHARS = 20_000;
+const MAX_PROFILE_JSON_CHARS = 2_000_000;
+const MIGRATION_TIMESTAMP = "2026-07-12T00:00:00.000Z";
 
 export class WorkspaceStateConflictError extends Error {
   currentState: WorkspaceState;
@@ -72,6 +87,7 @@ function defaultState(): WorkspaceState {
   return {
     schemaVersion: 1,
     config: deepCloneConfig(DEFAULT_CONFIG),
+    profiles: deepCloneUserProfiles(),
     versions: [],
     records: [],
     directChats: emptyDirectChats(),
@@ -107,26 +123,120 @@ function isStringRecord(value: unknown): value is Record<string, string> {
   return isObject(value) && Object.values(value).every((item) => typeof item === "string");
 }
 
+function isNonEmptyShortString(value: unknown, maxLength = 200): value is string {
+  return isShortString(value, maxLength) && value.trim().length > 0 && !value.includes("\0");
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function isProfileFields(value: unknown): value is Record<string, string> {
+  if (!isObject(value)) return false;
+  const entries = Object.entries(value);
+  if (entries.length > MAX_PROFILE_FIELDS) return false;
+  return entries.every(([key, fieldValue]) => /^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(key)
+    && typeof fieldValue === "string" && fieldValue.length <= MAX_PROFILE_FIELD_VALUE_CHARS
+    && !fieldValue.includes("\0"));
+}
+
+function isProfilePromptLayer(value: unknown): value is PromptLayer {
+  if (!isObject(value) || Object.keys(value).some((key) => !["enabled", "content", "variants"].includes(key))
+    || typeof value.enabled !== "boolean" || typeof value.content !== "string"
+    || value.content.length > 200_000 || !Array.isArray(value.variants) || value.variants.length > 100) return false;
+  const variantIds = new Set<string>();
+  return value.variants.every((variant) => {
+    if (!isObject(variant) || Object.keys(variant).some((key) => !["id", "name", "content", "createdAt"].includes(key))
+      || !isNonEmptyShortString(variant.id) || variantIds.has(variant.id)
+      || !isNonEmptyShortString(variant.name) || typeof variant.content !== "string"
+      || variant.content.length > 200_000 || !isIsoTimestamp(variant.createdAt)) return false;
+    variantIds.add(variant.id);
+    return true;
+  });
+}
+
+function isJsonData(value: unknown, seen = new Set<object>(), depth = 0): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || depth > 100 || seen.has(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false;
+  seen.add(value);
+  const valid = Array.isArray(value)
+    ? value.every((item) => isJsonData(item, seen, depth + 1))
+    : Object.entries(value).every(([key, item]) => key.length <= 500 && !key.includes("\0")
+      && isJsonData(item, seen, depth + 1));
+  seen.delete(value);
+  return valid;
+}
+
+function isProfileJson(value: unknown): boolean {
+  if (!isJsonData(value)) return false;
+  try {
+    return JSON.stringify(value).length <= MAX_PROFILE_JSON_CHARS;
+  } catch {
+    return false;
+  }
+}
+
+function isUserProfileRecord(value: unknown, expectedRole: "investor" | "founder"): value is UserProfileRecord {
+  const allowedKeys = new Set([
+    "id", "role", "name", "kind", "fields", "dynamicLayer", "fileIds", "memory", "dailyReport", "createdAt", "updatedAt",
+  ]);
+  if (!isObject(value) || Object.keys(value).length !== allowedKeys.size
+    || Object.keys(value).some((key) => !allowedKeys.has(key))
+    || !isNonEmptyShortString(value.id) || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value.id)
+    || value.role !== expectedRole || !isNonEmptyShortString(value.name) || value.name.trim() !== value.name
+    || (value.kind !== "preset" && value.kind !== "custom") || !isProfileFields(value.fields)
+    || !isProfilePromptLayer(value.dynamicLayer) || !Array.isArray(value.fileIds)
+    || value.fileIds.length > 20 || !isProfileJson(value.memory) || !isProfileJson(value.dailyReport)
+    || !isIsoTimestamp(value.createdAt) || !isIsoTimestamp(value.updatedAt)
+    || Date.parse(value.createdAt) > Date.parse(value.updatedAt)) return false;
+  const fileIds = value.fileIds;
+  return fileIds.every((fileId) => isNonEmptyShortString(fileId) && fileId.trim() === fileId)
+    && new Set(fileIds).size === fileIds.length;
+}
+
+function isUserProfileLibrary(value: unknown, enforceExclusiveFiles = true): value is UserProfileLibrary {
+  if (!isObject(value) || Object.keys(value).length !== 2
+    || !Object.hasOwn(value, "investor") || !Object.hasOwn(value, "founder")
+    || !Array.isArray(value.investor) || !Array.isArray(value.founder)
+    || value.investor.length < 1 || value.investor.length > MAX_USER_PROFILES_PER_ROLE
+    || value.founder.length < 1 || value.founder.length > MAX_USER_PROFILES_PER_ROLE
+    || !value.investor.every((profile) => isUserProfileRecord(profile, "investor"))
+    || !value.founder.every((profile) => isUserProfileRecord(profile, "founder"))) return false;
+  const ids = [...value.investor, ...value.founder].map((profile) => profile.id);
+  if (new Set(ids).size !== ids.length) return false;
+  if (!enforceExclusiveFiles) return true;
+  const profilesByRole = value as unknown as UserProfileLibrary;
+  return (["investor", "founder"] as const).every((role) => {
+    const fileIds = profilesByRole[role].flatMap((profile) => profile.fileIds);
+    return new Set(fileIds).size === fileIds.length;
+  });
+}
+
 function isBooleanRecord(value: unknown): value is Record<string, boolean> {
   return isObject(value) && Object.values(value).every((item) => typeof item === "boolean");
 }
 
 function isAgentProfile(value: unknown, expectedRole?: "investor" | "founder"): value is AgentProfile {
-  if (!isObject(value) || !isShortString(value.id) || !isAgentRole(value.role) || (expectedRole && value.role !== expectedRole)
-    || !isStringRecord(value.fields) || !isObject(value.prompts)) return false;
+  if (!isObject(value) || Object.keys(value).some((key) => !["id", "role", "fields", "prompts"].includes(key))
+    || !isNonEmptyShortString(value.id) || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value.id)
+    || !isAgentRole(value.role) || (expectedRole && value.role !== expectedRole)
+    || !isProfileFields(value.fields) || !isObject(value.prompts)
+    || Object.keys(value.prompts).length !== 5) return false;
   const prompts = value.prompts;
-  return ["platform", "tools", "user", "task", "dynamic"].every((key) => {
-    const layer = prompts[key];
-    return isObject(layer) && typeof layer.enabled === "boolean" && typeof layer.content === "string"
-      && Array.isArray(layer.variants) && layer.variants.every((variant) => isObject(variant)
-        && isShortString(variant.id) && isShortString(variant.name) && typeof variant.content === "string"
-        && typeof variant.createdAt === "string");
-  });
+  return ["platform", "tools", "user", "task", "dynamic"].every((key) => isProfilePromptLayer(prompts[key]));
 }
 
 function isRunSettings(value: unknown): value is RunSettings {
-  return isObject(value) && isFiniteNonNegative(value.maxRounds) && isAgentRole(value.firstSpeaker)
-    && isFiniteNonNegative(value.maxTokens) && typeof value.allowEarlyEnd === "boolean"
+  const keys = ["maxRounds", "firstSpeaker", "maxTokens", "allowEarlyEnd", "generatePublicResult", "generateMemories", "inputPricePerMillion", "outputPricePerMillion"];
+  return isObject(value) && Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key))
+    && Number.isInteger(value.maxRounds) && Number(value.maxRounds) >= 1 && Number(value.maxRounds) <= 20 && isAgentRole(value.firstSpeaker)
+    && Number.isInteger(value.maxTokens) && Number(value.maxTokens) >= 64 && Number(value.maxTokens) <= 16_000
+    && typeof value.allowEarlyEnd === "boolean"
     && typeof value.generatePublicResult === "boolean" && typeof value.generateMemories === "boolean"
     && isFiniteNonNegative(value.inputPricePerMillion) && isFiniteNonNegative(value.outputPricePerMillion);
 }
@@ -205,7 +315,8 @@ function isDirectChatThread(value: unknown, expectedRole: "investor" | "founder"
     && typeof value.createdAt === "string" && typeof value.updatedAt === "string"
     && isAgentProfile(value.agentSnapshot, expectedRole) && isRunSettings(value.settingsSnapshot)
     && typeof value.promptSnapshot === "string" && typeof value.jsonRepairPromptSnapshot === "string"
-    && isDemoAgentCard(value.counterpartyAgentCardSnapshot, otherAgentRole(expectedRole))
+    && (!Object.hasOwn(value, "counterpartyAgentCardSnapshot")
+      || isDemoAgentCard(value.counterpartyAgentCardSnapshot, otherAgentRole(expectedRole)))
     && Array.isArray(value.fileSnapshots) && value.fileSnapshots.length <= 20
     && value.fileSnapshots.every((file) => isAgentFileRecord(file, expectedRole))
     && Array.isArray(value.messages) && value.messages.every(isDirectChatMessage)
@@ -230,6 +341,11 @@ function normalizeDirectChatRoleState(value: unknown, role: "investor" | "founde
   const seen = new Set<string>();
   const threads = value.threads.flatMap((thread) => {
     if (!isDirectChatThread(thread, role) || seen.has(thread.id)) return [];
+    // Older user-test threads were created under the former peer-Card design.
+    // Do not expose or continue those histories after switching this feature to
+    // a user talking only with their own Agent; their debug calls may contain a
+    // frozen counterparty Card and therefore cannot be safely reinterpreted.
+    if (Object.hasOwn(thread, "counterpartyAgentCardSnapshot")) return [];
     seen.add(thread.id);
     return [clone(thread)];
   }).slice(0, MAX_DIRECT_CHAT_THREADS_PER_ROLE);
@@ -246,19 +362,165 @@ function normalizeDirectChats(value: unknown): DirectChatState {
   };
 }
 
-function isConfig(value: unknown): value is AppConfig {
+function isStoredConfig(value: unknown): value is AppConfig {
   if (!isObject(value)) return false;
   const investor = value.investor;
   const founder = value.founder;
-  return isObject(investor) && investor.role === "investor" && isObject(investor.prompts) && isObject(investor.fields)
-    && isObject(founder) && founder.role === "founder" && isObject(founder.prompts) && isObject(founder.fields)
+  return isObject(investor) && isNonEmptyShortString(investor.id) && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(investor.id)
+    && investor.role === "investor" && isObject(investor.prompts) && isObject(investor.fields)
+    && isObject(founder) && isNonEmptyShortString(founder.id) && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(founder.id)
+    && founder.role === "founder" && isObject(founder.prompts) && isObject(founder.fields)
     && isObject(value.settings);
 }
 
-function isVersion(value: unknown): value is SavedVersion {
+function isStrictConfig(value: unknown): value is AppConfig {
+  const keys = ["investor", "founder", "settings", "evaluatorPrompt", "memoryPrompts", "jsonRepairPrompt", "dailyReport"];
+  if (!isObject(value) || Object.keys(value).length !== keys.length || Object.keys(value).some((key) => !keys.includes(key))
+    || !isAgentProfile(value.investor, "investor") || !isAgentProfile(value.founder, "founder")
+    || value.investor.id === value.founder.id || !isRunSettings(value.settings)
+    || typeof value.evaluatorPrompt !== "string" || value.evaluatorPrompt.length > 200_000
+    || typeof value.jsonRepairPrompt !== "string" || value.jsonRepairPrompt.length > 200_000
+    || !isObject(value.memoryPrompts) || Object.keys(value.memoryPrompts).length !== 2
+    || typeof value.memoryPrompts.investor !== "string" || value.memoryPrompts.investor.length > 200_000
+    || typeof value.memoryPrompts.founder !== "string" || value.memoryPrompts.founder.length > 200_000
+    || !isObject(value.dailyReport) || Object.keys(value.dailyReport).length !== 2) return false;
+  const dailyReport = value.dailyReport as Record<AgentRole, unknown>;
+  return (["investor", "founder"] as const).every((role) => {
+    const report = dailyReport[role];
+    return isObject(report) && Object.keys(report).length === 5
+      && Object.keys(report).every((key) => ["taskPrompt", "dynamicPrompt", "taskVariants", "dynamicVariants", "maxTokens"].includes(key))
+      && typeof report.taskPrompt === "string" && typeof report.dynamicPrompt === "string"
+      && isProfilePromptLayer({ enabled: true, content: report.taskPrompt, variants: report.taskVariants })
+      && isProfilePromptLayer({ enabled: true, content: report.dynamicPrompt, variants: report.dynamicVariants })
+      && Number.isInteger(report.maxTokens) && Number(report.maxTokens) >= 64 && Number(report.maxTokens) <= 16_000;
+  });
+}
+
+function migrationTimestamp(value: unknown): string {
+  return isIsoTimestamp(value) ? value : MIGRATION_TIMESTAMP;
+}
+
+function profileDisplayName(role: "investor" | "founder", fields: Record<string, string>, recovered: boolean): string {
+  const fallback = role === "investor" ? "投资人资料" : "创业者资料";
+  const source = fields.agentName?.trim() || fields.organization?.trim() || fields.company?.trim() || fallback;
+  const name = recovered ? `已恢复 · ${source}` : source;
+  return name.slice(0, 200);
+}
+
+function profileJsonOrNull(value: unknown): unknown | null {
+  return isProfileJson(value) ? clone(value) : null;
+}
+
+function profileFromConfig(
+  config: AppConfig,
+  role: "investor" | "founder",
+  memory: unknown,
+  dailyReport: unknown,
+  timestamp: string,
+  recovered: boolean,
+): UserProfileRecord {
+  const current = config[role];
+  const defaultProfile = deepCloneUserProfiles()[role][0];
+  const fields = isProfileFields(current.fields) ? clone(current.fields) : defaultProfile.fields;
+  const dynamicLayer = isProfilePromptLayer(current.prompts.dynamic)
+    ? clone(current.prompts.dynamic)
+    : defaultProfile.dynamicLayer;
+  return {
+    id: current.id,
+    role,
+    name: profileDisplayName(role, fields, recovered),
+    kind: "custom",
+    fields,
+    dynamicLayer,
+    fileIds: [],
+    memory: profileJsonOrNull(memory),
+    dailyReport: profileJsonOrNull(dailyReport),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function migrateMissingProfiles(
+  config: AppConfig,
+  memories: unknown,
+  dailyReports: unknown,
+  timestamp: string,
+): UserProfileLibrary {
+  const profiles = deepCloneUserProfiles();
+  (["investor", "founder"] as const).forEach((role) => {
+    const memory = isRolePair(memories) ? memories[role] : null;
+    const dailyReport = isRolePair(dailyReports) ? dailyReports[role] : null;
+    const presetIndex = profiles[role].findIndex((profile) => profile.id === config[role].id);
+    if (presetIndex >= 0) {
+      const preset = profiles[role][presetIndex];
+      const fields = isProfileFields(config[role].fields) ? clone(config[role].fields) : preset.fields;
+      profiles[role][presetIndex] = {
+        ...preset,
+        fields,
+        dynamicLayer: isProfilePromptLayer(config[role].prompts.dynamic)
+          ? clone(config[role].prompts.dynamic)
+          : preset.dynamicLayer,
+        memory: profileJsonOrNull(memory),
+        dailyReport: profileJsonOrNull(dailyReport),
+        updatedAt: timestamp,
+      };
+      return;
+    }
+    profiles[role] = [
+      profileFromConfig(config, role, memory, dailyReport, timestamp, false),
+      ...profiles[role],
+    ];
+  });
+  return profiles;
+}
+
+function normalizeProfiles(
+  value: unknown,
+  config: AppConfig,
+  memories: unknown,
+  dailyReports: unknown,
+  updatedAt: unknown,
+): UserProfileLibrary {
+  const timestamp = migrationTimestamp(updatedAt);
+  if (!isUserProfileLibrary(value, false)) return migrateMissingProfiles(config, memories, dailyReports, timestamp);
+  const profiles = clone(value);
+  (["investor", "founder"] as const).forEach((role) => {
+    const seenFileIds = new Set<string>();
+    profiles[role] = profiles[role].map((profile) => {
+      const fileIds = profile.fileIds.filter((fileId) => {
+        if (seenFileIds.has(fileId)) return false;
+        seenFileIds.add(fileId);
+        return true;
+      });
+      return fileIds.length === profile.fileIds.length ? profile : { ...profile, fileIds, updatedAt: timestamp };
+    });
+  });
+  (["investor", "founder"] as const).forEach((role) => {
+    if (profiles[role].some((profile) => profile.id === config[role].id)) return;
+    const memory = isRolePair(memories) ? memories[role] : null;
+    const dailyReport = isRolePair(dailyReports) ? dailyReports[role] : null;
+    profiles[role] = [
+      profileFromConfig(config, role, memory, dailyReport, timestamp, true),
+      ...profiles[role].slice(0, MAX_USER_PROFILES_PER_ROLE - 1),
+    ];
+  });
+  // The persisted library was valid before recovery. A conflicting legacy ID
+  // across roles is not representable as two Agent IDs, so fall back to the
+  // deterministic migration instead of returning an invalid state.
+  return isUserProfileLibrary(profiles)
+    ? profiles
+    : migrateMissingProfiles(config, memories, dailyReports, timestamp);
+}
+
+function isStoredVersion(value: unknown): value is SavedVersion {
   return isObject(value) && typeof value.id === "string" && value.id.length <= 200
     && typeof value.name === "string" && value.name.length <= 200
-    && typeof value.createdAt === "string" && isConfig(value.config);
+    && typeof value.createdAt === "string" && isStoredConfig(value.config);
+}
+
+function isStrictVersion(value: unknown): value is SavedVersion {
+  return isObject(value) && isNonEmptyShortString(value.id) && isNonEmptyShortString(value.name)
+    && isIsoTimestamp(value.createdAt) && isStrictConfig(value.config);
 }
 
 function isSimulationRecord(value: unknown): value is SimulationRecord {
@@ -281,14 +543,18 @@ function isNullableId(value: unknown): value is string | null {
 function normalizeStoredState(value: unknown): WorkspaceState {
   const fallback = defaultState();
   if (!isObject(value)) return fallback;
+  const config = isStoredConfig(value.config) ? clone(value.config) : fallback.config;
+  const memories = isRolePair(value.memories) ? clone(value.memories) : fallback.memories;
+  const dailyReports = isRolePair(value.dailyReports) ? clone(value.dailyReports) : fallback.dailyReports;
   return {
     schemaVersion: 1,
-    config: isConfig(value.config) ? clone(value.config) : fallback.config,
-    versions: Array.isArray(value.versions) ? value.versions.filter(isVersion).slice(0, MAX_VERSIONS) : [],
+    config,
+    profiles: normalizeProfiles(value.profiles, config, memories, dailyReports, value.updatedAt),
+    versions: Array.isArray(value.versions) ? value.versions.filter(isStoredVersion).slice(0, MAX_VERSIONS) : [],
     records: Array.isArray(value.records) ? value.records.filter(isSimulationRecord).slice(0, MAX_RECORDS) : [],
     directChats: normalizeDirectChats(value.directChats),
-    memories: isRolePair(value.memories) ? clone(value.memories) : fallback.memories,
-    dailyReports: isRolePair(value.dailyReports) ? clone(value.dailyReports) : fallback.dailyReports,
+    memories,
+    dailyReports,
     activeVersion: isNullableId(value.activeVersion) ? value.activeVersion : null,
     activeRecordId: isNullableId(value.activeRecordId) ? value.activeRecordId : null,
     updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : null,
@@ -317,18 +583,24 @@ export function getWorkspaceState(): WorkspaceState {
 
 export function validateWorkspacePatch(value: unknown): WorkspaceStatePatch {
   if (!isObject(value)) throw new Error("请求体必须是 JSON 对象。");
-  const allowed = new Set(["config", "versions", "records", "directChats", "memories", "dailyReports", "activeVersion", "activeRecordId"]);
+  const allowed = new Set(["config", "profiles", "versions", "records", "directChats", "memories", "dailyReports", "activeVersion", "activeRecordId"]);
   const unknownKeys = Object.keys(value).filter((key) => !allowed.has(key));
   if (unknownKeys.length) throw new Error(`不支持的字段：${unknownKeys.join("、")}。`);
   if (!Object.keys(value).length) throw new Error("至少提供一个需要保存的字段。");
 
   const patch: WorkspaceStatePatch = {};
   if (Object.hasOwn(value, "config")) {
-    if (!isConfig(value.config)) throw new Error("config 结构无效。");
+    if (!isStrictConfig(value.config)) throw new Error("config 结构无效。");
     patch.config = clone(value.config);
   }
+  if (Object.hasOwn(value, "profiles")) {
+    if (!isUserProfileLibrary(value.profiles)) {
+      throw new Error(`profiles 结构无效；每个角色必须有 1–${MAX_USER_PROFILES_PER_ROLE} 套资料，且 Agent ID 必须唯一。`);
+    }
+    patch.profiles = clone(value.profiles);
+  }
   if (Object.hasOwn(value, "versions")) {
-    if (!Array.isArray(value.versions) || value.versions.length > MAX_VERSIONS || !value.versions.every(isVersion)) {
+    if (!Array.isArray(value.versions) || value.versions.length > MAX_VERSIONS || !value.versions.every(isStrictVersion)) {
       throw new Error(`versions 必须是有效数组且不能超过 ${MAX_VERSIONS} 条。`);
     }
     patch.versions = clone(value.versions);
@@ -371,13 +643,35 @@ export function saveWorkspaceState(patch: WorkspaceStatePatch, expectedUpdatedAt
   try {
     const current = readState(database);
     if (current.updatedAt !== expectedUpdatedAt) throw new WorkspaceStateConflictError(current);
-    const next: WorkspaceState = {
+    const revision = nextRevision(current.updatedAt);
+    const merged = {
       ...current,
       ...clone(patch),
+    };
+    const profiles = normalizeProfiles(merged.profiles, merged.config, merged.memories, merged.dailyReports, revision);
+    const config = clone(merged.config);
+    (["investor", "founder"] as const).forEach((role) => {
+      const profile = profiles[role].find((item) => item.id === config[role].id) || profiles[role][0];
+      config[role] = {
+        ...config[role],
+        id: profile.id,
+        fields: clone(profile.fields),
+        prompts: { ...config[role].prompts, dynamic: clone(profile.dynamicLayer) },
+      };
+    });
+    const activeInvestor = profiles.investor.find((profile) => profile.id === config.investor.id) || profiles.investor[0];
+    const activeFounder = profiles.founder.find((profile) => profile.id === config.founder.id) || profiles.founder[0];
+    const next: WorkspaceState = {
+      ...merged,
       schemaVersion: 1,
+      config,
+      profiles,
+      directChats: normalizeDirectChats(merged.directChats),
+      memories: { investor: clone(activeInvestor.memory), founder: clone(activeFounder.memory) },
+      dailyReports: { investor: clone(activeInvestor.dailyReport), founder: clone(activeFounder.dailyReport) },
       // `updatedAt` also acts as the optimistic-concurrency revision. Keep it
       // strictly monotonic even when two writes land in the same millisecond.
-      updatedAt: nextRevision(current.updatedAt),
+      updatedAt: revision,
     };
     const serialized = JSON.stringify(next);
     if (serialized.length > MAX_STATE_CHARS) throw new Error("工作区总数据超过 24MB，请删除部分历史记录后重试。");

@@ -1,5 +1,6 @@
 import { isAuthenticated, isSameOrigin } from "@/lib/auth";
-import { PRIVATE_FILE_TOOL, isAgentRole, searchAgentFiles } from "@/lib/file-store";
+import { PRIVATE_FILE_TOOL, isAgentRole, listAgentFiles, searchAgentFiles } from "@/lib/file-store";
+import { getWorkspaceState } from "@/lib/workspace-store";
 import type { AgentRole, ToolExecutionTrace } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -22,6 +23,7 @@ interface ModelRequest {
   messages: ModelMessage[];
   maxTokens: number;
   agentRole?: AgentRole;
+  profileId?: string;
   fileIds?: string[];
   toolsEnabled?: boolean;
 }
@@ -95,7 +97,23 @@ export async function POST(request: Request) {
   if (totalMessageChars > 600_000) return error("请求校验失败", "消息总长度不能超过 600,000 字符。", 413);
   const activeRole = isAgentRole(body.agentRole) ? body.agentRole : null;
   const toolsEnabled = Boolean(body.toolsEnabled && activeRole);
-  const fileIds = Array.isArray(body.fileIds) ? body.fileIds.filter((value): value is string => typeof value === "string").slice(0, 20) : [];
+  const requestedFileIds = Array.isArray(body.fileIds) ? body.fileIds.filter((value): value is string => typeof value === "string").slice(0, 20) : [];
+  const activeProfile = activeRole && typeof body.profileId === "string"
+    ? getWorkspaceState().profiles[activeRole].find((profile) => profile.id === body.profileId)
+    : null;
+  if (toolsEnabled && !activeProfile) {
+    return error("文件工具作用域无效", "当前用户资料尚未保存到服务器，或资料 ID 不属于该 Agent。", 400);
+  }
+  const allowedFileIds = new Set(activeProfile?.fileIds || []);
+  const rejectedFileIds = requestedFileIds.filter((fileId) => !allowedFileIds.has(fileId));
+  if (toolsEnabled && rejectedFileIds.length) {
+    const existingFiles = await Promise.all([listAgentFiles("investor"), listAgentFiles("founder")]);
+    const existingFileIds = new Set(existingFiles.flat().map((file) => file.id));
+    if (rejectedFileIds.some((fileId) => existingFileIds.has(fileId))) {
+      return error("文件工具作用域无效", "请求包含未关联当前用户资料的文件。", 400);
+    }
+  }
+  const fileIds = requestedFileIds.filter((fileId) => allowedFileIds.has(fileId));
   const messages: ModelMessage[] = body.messages.map((message) => ({ role: message.role, content: message.content }));
 
   const controller = new AbortController();

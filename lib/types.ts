@@ -23,6 +23,23 @@ export interface AgentProfile {
   prompts: PromptLayers;
 }
 
+export interface UserProfileRecord {
+  /** 资料 ID 同时也是对外 Agent ID。 */
+  id: string;
+  role: AgentRole;
+  name: string;
+  kind: "preset" | "custom";
+  fields: Record<string, string>;
+  dynamicLayer: PromptLayer;
+  fileIds: string[];
+  memory: unknown | null;
+  dailyReport: unknown | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type UserProfileLibrary = Record<AgentRole, UserProfileRecord[]>;
+
 export interface RunSettings {
   maxRounds: number;
   firstSpeaker: AgentRole;
@@ -198,7 +215,8 @@ export interface DirectChatThread {
   settingsSnapshot: RunSettings;
   promptSnapshot: string;
   jsonRepairPromptSnapshot: string;
-  counterpartyAgentCardSnapshot: DemoAgentCard;
+  /** @deprecated 仅用于兼容旧直聊记录；新建用户直聊不再注入对方 Agent Card。 */
+  counterpartyAgentCardSnapshot?: DemoAgentCard;
   fileSnapshots: AgentFileRecord[];
   messages: DirectChatMessage[];
   debugCalls: DebugCall[];
@@ -246,6 +264,7 @@ export interface SavedVersion {
 export interface WorkspaceState {
   schemaVersion: 1;
   config: AppConfig;
+  profiles: UserProfileLibrary;
   versions: SavedVersion[];
   records: SimulationRecord[];
   directChats: DirectChatState;
@@ -257,7 +276,7 @@ export interface WorkspaceState {
 }
 
 export type WorkspaceStatePatch = Partial<Pick<WorkspaceState,
-  "config" | "versions" | "records" | "directChats" | "memories" | "dailyReports" | "activeVersion" | "activeRecordId"
+  "config" | "profiles" | "versions" | "records" | "directChats" | "memories" | "dailyReports" | "activeVersion" | "activeRecordId"
 >>;
 
 export type FieldInputType = "text" | "textarea" | "select" | "multiselect" | "date";

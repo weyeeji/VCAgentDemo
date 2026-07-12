@@ -1,4 +1,14 @@
-import type { AgentProfile, AppConfig, AgentRole, DemoAgentCard, FieldDefinition, LayerKey, PromptLayer, RunSettings } from "./types";
+import type {
+  AgentProfile,
+  AppConfig,
+  AgentRole,
+  DemoAgentCard,
+  FieldDefinition,
+  LayerKey,
+  PromptLayer,
+  RunSettings,
+  UserProfileLibrary,
+} from "./types";
 
 export const LAYER_LABELS: Record<LayerKey, string> = {
   platform: "平台层",
@@ -343,6 +353,149 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
 };
 
+const DEFAULT_PROFILE_TIMESTAMP = "2026-07-12T00:00:00.000Z";
+
+function freezeDeep<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    Object.values(value).forEach((nested) => freezeDeep(nested));
+  }
+  return value;
+}
+
+function emptyProfileDynamicLayer(): PromptLayer {
+  return { ...promptLayer(""), enabled: false };
+}
+
+const medicalInvestorFields: Record<string, string> = {
+  agentName: "康桥产业基金 · 顾宁",
+  personName: "顾宁",
+  organization: "康桥产业基金",
+  investorType: "产业资本 / CVC",
+  title: "产业投资负责人",
+  decisionAuthority: "可立项并推进投委会",
+  deploymentStatus: "选择性出手",
+  sectors: "医疗健康",
+  stages: "B 轮、C 轮",
+  investmentCurrency: "人民币 CNY",
+  checkSize: "5000 万–1 亿",
+  geography: "中国大陆",
+  leadPreference: "倾向领投",
+  decisionStyle: "技术壁垒、真实付费、增长速度、产业协同、合规性",
+  exclusions: "博彩、虚拟币/高风险金融、强监管且路径不清",
+  mustAskQuestions: "核心产品已完成哪些注册、临床验证或准入节点？\n近 12 个月收入、毛利率、医院复购或装机利用率分别是多少？\n本轮资金将覆盖哪些注册、产能和商业化里程碑？",
+  resourceStrengths: "产业客户、供应链、政府关系、后续融资",
+  investmentPace: "2–3 个月",
+  targetOwnership: "10%–20%",
+  followOnReserve: "通常预留",
+  boardPreference: "希望观察员席位",
+  conflictPolicy: "已有竞品需披露、竞品项目严格隔离",
+  dueDiligenceFocus: "财务与流水、客户合同、知识产权、合规牌照、股权结构",
+  communicationStyle: "审慎克制",
+  hardRequirements: "医疗产品需有清晰合规路径，关键业务数据可在正式尽调中核验。",
+};
+
+const medicalFounderFields: Record<string, string> = {
+  agentName: "循准医疗 · 许澄",
+  personName: "许澄",
+  company: "循准医疗",
+  oneLiner: "面向三级医院检验科的多重病原快检平台，通过微流控耗材与配套仪器缩短检测时间并提供标准化质控。",
+  industry: "医疗健康",
+  customerType: "医疗机构",
+  businessModel: "硬件销售、按量付费",
+  geography: "中国大陆",
+  round: "B 轮",
+  raiseCurrency: "人民币 CNY",
+  raiseAmount: "5000 万–1 亿",
+  closeTimeline: "3–6 个月",
+  productStage: "规模化增长",
+  team: "核心团队 6 人，覆盖体外诊断研发、注册临床、供应链与医院商业化（样例，未验证）。",
+  traction: "截至 2026-06-30，产品进入 42 家医院，其中 28 家持续采购耗材；近 12 个月确认收入约 6800 万元（样例，未验证）。",
+  tractionAsOf: "2026-06-30",
+  advantages: "医院现有方案依赖送检或多台设备组合；项目以一体化微流控耗材、较短检测时间和标准化质控形成差异化。",
+  useOfFunds: "供应链/产能、市场销售、合规资质、补充运营资金",
+  riskCategories: "牌照与监管、供应链、客户集中、现金流",
+  mustAskQuestions: "贵机构是否有医疗器械注册与医院商业化经验？\n投委会通常重点核验哪些临床与财务材料？\n是否存在需要提前披露的同类项目或产业方利益冲突？",
+  valuation: "投前人民币 6–8 亿元（样例预期，未确定）",
+  runway: "6–12 个月",
+  fundraisingProgress: "已有正式会议",
+  priorFinancing: "已完成天使轮与 A 轮，累计融资约 9000 万元（样例，未验证）",
+  regulatoryStatus: "牌照已取得、核心 IP 归属已确认",
+  materialsReady: "商业计划书、财务模型、客户合同摘要、知识产权清单、合规材料",
+  governanceBoundaries: "不接受控制权变更、需排除竞品关联、条款需另行专业审阅",
+  desiredResources: "产业客户、供应链、政府关系、后续融资",
+  investorExclusions: "竞品关联方、控制权要求过强",
+  challenges: "新增产线爬坡和医院回款周期带来阶段性现金流压力。",
+  communicationStyle: "审慎克制",
+};
+
+/**
+ * 两组可直接切换的测试资料。常量在运行时递归冻结；使用方必须先深克隆，
+ * 避免编辑资料时污染后续请求或其他用户的默认值。
+ */
+export const DEFAULT_USER_PROFILES: UserProfileLibrary = freezeDeep({
+  investor: [
+    {
+      id: investor.id,
+      role: "investor",
+      name: "A · AI 企业服务早期",
+      kind: "preset",
+      fields: JSON.parse(JSON.stringify(investor.fields)) as Record<string, string>,
+      dynamicLayer: JSON.parse(JSON.stringify(investor.prompts.dynamic)) as PromptLayer,
+      fileIds: [],
+      memory: null,
+      dailyReport: null,
+      createdAt: DEFAULT_PROFILE_TIMESTAMP,
+      updatedAt: DEFAULT_PROFILE_TIMESTAMP,
+    },
+    {
+      id: "investor-demo-002",
+      role: "investor",
+      name: "B · 医疗健康成长期",
+      kind: "preset",
+      fields: medicalInvestorFields,
+      dynamicLayer: emptyProfileDynamicLayer(),
+      fileIds: [],
+      memory: null,
+      dailyReport: null,
+      createdAt: DEFAULT_PROFILE_TIMESTAMP,
+      updatedAt: DEFAULT_PROFILE_TIMESTAMP,
+    },
+  ],
+  founder: [
+    {
+      id: founder.id,
+      role: "founder",
+      name: "A · 工业 AI 企业服务",
+      kind: "preset",
+      fields: JSON.parse(JSON.stringify(founder.fields)) as Record<string, string>,
+      dynamicLayer: JSON.parse(JSON.stringify(founder.prompts.dynamic)) as PromptLayer,
+      fileIds: [],
+      memory: null,
+      dailyReport: null,
+      createdAt: DEFAULT_PROFILE_TIMESTAMP,
+      updatedAt: DEFAULT_PROFILE_TIMESTAMP,
+    },
+    {
+      id: "founder-demo-002",
+      role: "founder",
+      name: "B · 医疗器械成长期",
+      kind: "preset",
+      fields: medicalFounderFields,
+      dynamicLayer: emptyProfileDynamicLayer(),
+      fileIds: [],
+      memory: null,
+      dailyReport: null,
+      createdAt: DEFAULT_PROFILE_TIMESTAMP,
+      updatedAt: DEFAULT_PROFILE_TIMESTAMP,
+    },
+  ],
+});
+
+export function deepCloneUserProfiles(profiles: UserProfileLibrary = DEFAULT_USER_PROFILES): UserProfileLibrary {
+  return JSON.parse(JSON.stringify(profiles)) as UserProfileLibrary;
+}
+
 export function deepCloneConfig(config: AppConfig): AppConfig {
   return JSON.parse(JSON.stringify(config));
 }
@@ -401,10 +554,11 @@ export function composeDirectChatPrompt(agent: AgentProfile, settings: RunSettin
   const directChatRuntime = `[本次运行设置]
 以下设置会随系统提示词传给 Agent。当前是用户与本 Agent 的人工测试对话，复用双 Agent 对话完全相同的五层内容，但由平台按以下规则执行：
 1. 对话对象：当前消息来自用户，只需以本 Agent 身份回应，不得模拟另一个 Agent 发言。
-2. 总轮数：不设上限。普通双 Agent 模拟中的最大轮数和先发言方设置在此不适用。即使之前曾建议结束，用户继续发送有效消息时仍应正常回应。
-3. 单次回复最大输出：${settings.maxTokens} Token。上限由平台强制执行；应保持回复聚焦、完整。
-4. 对话生命周期：只有用户点击“创建新对话”才会切换会话；control 中的结束建议不会自动关闭本对话。
-5. 会后流程：本测试对话不生成公共结果、不更新双方私有记忆，也不触发日报；当前 Agent 不得在回复中代替平台执行这些任务。`;
+2. 可用信息范围：本模式不会提供、注入或使用另一个 Agent 的 Agent Card。只能依据本 Agent 用户层中已保存的资料、用户在当前对话中明确提供的信息，以及本 Agent 私有文件工具在当前请求中实际返回的命中内容回答；不得把另一个 Agent 的 Card、资料或文件当作可用来源。缺少依据时必须明确回答“不知道”或“暂无信息”。
+3. 总轮数：不设上限。普通双 Agent 模拟中的最大轮数和先发言方设置在此不适用。即使之前曾建议结束，用户继续发送有效消息时仍应正常回应。
+4. 单次回复最大输出：${settings.maxTokens} Token。上限由平台强制执行；应保持回复聚焦、完整。
+5. 对话生命周期：只有用户点击“创建新对话”才会切换会话；control 中的结束建议不会自动关闭本对话。
+6. 会后流程：本测试对话不生成公共结果、不更新双方私有记忆，也不触发日报；当前 Agent 不得在回复中代替平台执行这些任务。`;
   return composeAgentPrompt(agent, settings, { runtimeOverride: directChatRuntime });
 }
 

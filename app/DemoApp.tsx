@@ -17,6 +17,7 @@ import {
   formatProfile,
   isAgentCardField,
 } from "@/lib/defaults";
+import { attachPresetDemoFileIds } from "@/lib/demo-file-links";
 import type {
   AgentProfile,
   AgentFileRecord,
@@ -1445,26 +1446,13 @@ export default function DemoApp() {
   useEffect(() => {
     if (!workspaceReady || !agentFilesReady || orphanFileMigrationDoneRef.current) return;
     orphanFileMigrationDoneRef.current = true;
+    const readyFileIds = new Set(
+      (["investor", "founder"] as AgentRole[]).flatMap((role) => agentFiles[role].filter((file) => file.status === "ready").map((file) => file.id)),
+    );
+    if (!readyFileIds.size) return;
     setProfiles((current) => {
-      const next = clone(current);
-      let changed = false;
-      (["investor", "founder"] as AgentRole[]).forEach((role) => {
-        const assigned = new Set(next[role].flatMap((profile) => profile.fileIds));
-        const orphanIds = agentFiles[role].map((file) => file.id).filter((fileId) => !assigned.has(fileId));
-        if (!orphanIds.length) return;
-        // One-time legacy/recovery migration is deterministic: role-level files
-        // from older builds attach to preset A, never whichever profile happens
-        // to be selected when the page loads.
-        const index = next[role].findIndex((profile) => profile.id === DEFAULT_CONFIG[role].id);
-        if (index < 0) return;
-        next[role][index] = {
-          ...next[role][index],
-          fileIds: [...new Set([...next[role][index].fileIds, ...orphanIds])].slice(0, 20),
-          updatedAt: new Date().toISOString(),
-        };
-        changed = true;
-      });
-      return changed ? next : current;
+      const next = attachPresetDemoFileIds(current, readyFileIds, new Date().toISOString());
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
     });
   }, [agentFiles, agentFilesReady, workspaceReady]);
   useEffect(() => {
@@ -2302,6 +2290,14 @@ export default function DemoApp() {
         {tab === "conversation" && <div className="conversation-layout">
           <aside className="controls">
             <div className="control-title"><strong>本次运行设置</strong><span>编辑仅影响下一次模拟</span></div>
+            <div className="run-buttons">
+              {!busy && <button className="primary" disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={start}>▶ 开始模拟</button>}
+              {status === "running" && <button onClick={() => { pauseRef.current = true; setStatus("paused"); }}>Ⅱ 暂停</button>}
+              {status === "paused" && <button className="primary" onClick={() => { pauseRef.current = false; setStatus("running"); }}>▶ 继续</button>}
+              {busy && <button className="danger" onClick={stop}>■ 停止</button>}
+              {!busy && messages.length > 0 && <button disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={rerunLastSnapshot}>↻ 按原快照重新生成</button>}
+              <button disabled={dailyBusy !== null || directChatBusy !== null || (busy && status !== "paused")} onClick={reset}>重置</button>
+            </div>
             <div className="run-settings-note">对话规则会写入任务层传给双方 Agent；“结果 / 记忆”开关由平台在对话后调度执行。</div>
             <div className="control-grid">
               <label>最大对话轮数<input type="number" min={1} max={20} value={config.settings.maxRounds} disabled={busy} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, maxRounds: Number(event.target.value) } })} /></label>
@@ -2314,14 +2310,6 @@ export default function DemoApp() {
               <Toggle label="生成双方私有记忆" checked={config.settings.generateMemories} onChange={(value) => persistConfig({ ...config, settings: { ...config.settings, generateMemories: value } })} />
             </div>
             <details className="price-settings"><summary>成本估算单价</summary><label>输入 $ / 1M<input type="number" min={0} step="0.01" value={config.settings.inputPricePerMillion} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, inputPricePerMillion: Number(event.target.value) } })} /></label><label>输出 $ / 1M<input type="number" min={0} step="0.01" value={config.settings.outputPricePerMillion} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, outputPricePerMillion: Number(event.target.value) } })} /></label></details>
-            <div className="run-buttons">
-              {!busy && <button className="primary" disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={start}>▶ 开始模拟</button>}
-              {status === "running" && <button onClick={() => { pauseRef.current = true; setStatus("paused"); }}>Ⅱ 暂停</button>}
-              {status === "paused" && <button className="primary" onClick={() => { pauseRef.current = false; setStatus("running"); }}>▶ 继续</button>}
-              {busy && <button className="danger" onClick={stop}>■ 停止</button>}
-              {!busy && messages.length > 0 && <button disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={rerunLastSnapshot}>↻ 按原快照重新生成</button>}
-              <button disabled={dailyBusy !== null || directChatBusy !== null || (busy && status !== "paused")} onClick={reset}>重置</button>
-            </div>
             <div className="run-summary"><span>输入 <b>{totalStats.input}</b></span><span>输出 <b>{totalStats.output}</b></span><span>估算成本 <b>{money(totalStats.cost)}</b></span></div>
           </aside>
           <div className="conversation-pane"><Conversation messages={messages} runningRole={runningRole} status={status} />{errors.length > 0 && <div className="error-stack">{errors.map((error, index) => <div key={index}>! {error}</div>)}</div>}</div>

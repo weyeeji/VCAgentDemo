@@ -1,4 +1,5 @@
 import { isAuthenticated, isSameOrigin } from "@/lib/auth";
+import { initializeFileStore } from "@/lib/file-store";
 import { WorkspaceStateConflictError, getWorkspaceState, saveWorkspaceState, validateWorkspacePatch } from "@/lib/workspace-store";
 
 export const runtime = "nodejs";
@@ -11,6 +12,7 @@ export async function GET(request: Request) {
     return Response.json({ error: "请重新登录。" }, { status: 401, headers: NO_STORE });
   }
   try {
+    await initializeFileStore();
     return Response.json({ state: getWorkspaceState() }, { headers: NO_STORE });
   } catch (error) {
     return Response.json({ error: `读取服务端工作区失败：${error instanceof Error ? error.message : String(error)}` }, { status: 500, headers: NO_STORE });

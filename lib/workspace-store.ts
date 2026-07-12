@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
+import { attachPresetDemoFileIds } from "./demo-file-links";
 import {
   buildCanonicalAgentCard,
   DEFAULT_CONFIG,
@@ -474,6 +475,15 @@ function migrateMissingProfiles(
   return profiles;
 }
 
+function listReadyAgentFileIds(): Set<string> {
+  try {
+    const rows = db().prepare("SELECT id FROM agent_files WHERE status = 'ready'").all() as Array<{ id: string }>;
+    return new Set(rows.map((row) => String(row.id)));
+  } catch {
+    return new Set();
+  }
+}
+
 function normalizeProfiles(
   value: unknown,
   config: AppConfig,
@@ -482,7 +492,13 @@ function normalizeProfiles(
   updatedAt: unknown,
 ): UserProfileLibrary {
   const timestamp = migrationTimestamp(updatedAt);
-  if (!isUserProfileLibrary(value, false)) return migrateMissingProfiles(config, memories, dailyReports, timestamp);
+  if (!isUserProfileLibrary(value, false)) {
+    return attachPresetDemoFileIds(
+      migrateMissingProfiles(config, memories, dailyReports, timestamp),
+      listReadyAgentFileIds(),
+      timestamp,
+    );
+  }
   const profiles = clone(value);
   (["investor", "founder"] as const).forEach((role) => {
     const seenFileIds = new Set<string>();
@@ -507,9 +523,10 @@ function normalizeProfiles(
   // The persisted library was valid before recovery. A conflicting legacy ID
   // across roles is not representable as two Agent IDs, so fall back to the
   // deterministic migration instead of returning an invalid state.
-  return isUserProfileLibrary(profiles)
+  const resolved = isUserProfileLibrary(profiles)
     ? profiles
     : migrateMissingProfiles(config, memories, dailyReports, timestamp);
+  return attachPresetDemoFileIds(resolved, listReadyAgentFileIds(), timestamp);
 }
 
 function isStoredVersion(value: unknown): value is SavedVersion {

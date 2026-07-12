@@ -12,10 +12,12 @@ const CHUNK_OVERLAP = 120;
 const ALLOWED_EXTENSIONS = new Set([".pdf", ".docx", ".txt", ".md", ".markdown", ".csv"]);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), "data");
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
+const PDF_DIR = path.join(process.cwd(), "output", "pdf");
 const DB_PATH = path.join(DATA_DIR, "app.db");
 
 declare global {
   var __ventureFileDb: DatabaseSync | undefined;
+  var __ventureDemoSeedDone: boolean | undefined;
 }
 
 function db(): DatabaseSync {
@@ -76,7 +78,12 @@ function mapFile(row: Record<string, unknown>): AgentFileRecord {
 
 export async function initializeFileStore(): Promise<void> {
   await mkdir(UPLOAD_DIR, { recursive: true });
-  db();
+  const database = db();
+  if (!globalThis.__ventureDemoSeedDone) {
+    const { ensureDemoSeedFiles } = await import("./demo-seed");
+    await ensureDemoSeedFiles(database, UPLOAD_DIR, PDF_DIR);
+    globalThis.__ventureDemoSeedDone = true;
+  }
 }
 
 export async function listAgentFiles(role: AgentRole): Promise<AgentFileRecord[]> {

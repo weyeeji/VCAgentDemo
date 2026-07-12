@@ -7,3 +7,8 @@ declare module "pdf-parse" {
 
   export default function pdfParse(buffer: Buffer): Promise<PdfParseResult>;
 }
+
+declare module "pdf-parse/lib/pdf-parse.js" {
+  import pdfParse from "pdf-parse";
+  export default pdfParse;
+}

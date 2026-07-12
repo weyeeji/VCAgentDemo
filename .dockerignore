@@ -1,8 +1,6 @@
 .env
 .git
 .next
-data
 node_modules
 work
-outputs
 npm-debug.log*

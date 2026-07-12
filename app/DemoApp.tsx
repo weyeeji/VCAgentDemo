@@ -41,6 +41,7 @@ import type {
   WorkspaceState,
   WorkspaceStatePatch,
 } from "@/lib/types";
+import { JsonReadableView, type JsonDisplayKind } from "@/lib/json-display";
 
 const LEGACY_CONFIG_KEY = "vc-agent-debugger:config:v1";
 const LEGACY_VERSION_KEY = "vc-agent-debugger:versions:v1";
@@ -528,12 +529,26 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (val
   );
 }
 
-function JsonPanel({ title, value, onChange, error, disabled = false }: { title: string; value: unknown | null; onChange: (value: unknown) => void; error?: { raw: string; error: string }; disabled?: boolean }) {
-  const [mode, setMode] = useState<"formatted" | "raw">("formatted");
+function JsonPanel({
+  title,
+  value,
+  onChange,
+  error,
+  disabled = false,
+  displayKind = "generic",
+}: {
+  title: string;
+  value: unknown | null;
+  onChange: (value: unknown) => void;
+  error?: { raw: string; error: string };
+  disabled?: boolean;
+  displayKind?: JsonDisplayKind;
+}) {
+  const [mode, setMode] = useState<"read" | "raw">("read");
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [editError, setEditError] = useState("");
-  const rendered = value === null ? "" : mode === "formatted" ? JSON.stringify(value, null, 2) : JSON.stringify(value);
+  const rendered = value === null ? "" : JSON.stringify(value, null, 2);
 
   function save() {
     try {
@@ -550,7 +565,7 @@ function JsonPanel({ title, value, onChange, error, disabled = false }: { title:
       <div className="card-heading">
         <div><span className="status-dot" /> <strong>{title}</strong></div>
         <div className="mini-actions">
-          <button onClick={() => setMode(mode === "formatted" ? "raw" : "formatted")}>{mode === "formatted" ? "原始" : "格式化"}</button>
+          <button onClick={() => setMode(mode === "read" ? "raw" : "read")}>{mode === "read" ? "原始 JSON" : "阅读视图"}</button>
           <button disabled={disabled} onClick={() => { setDraft(rendered || error?.raw || "{}"); setEditing(!editing); }}>{editing ? "取消" : "编辑"}</button>
           <button disabled={!value && !error?.raw} onClick={() => copyText(rendered || error?.raw || "")}>复制</button>
           <button disabled={!value && !error?.raw} onClick={() => downloadJson(`${title}.json`, value ?? { raw: error?.raw, error: error?.error })}>下载</button>
@@ -559,7 +574,11 @@ function JsonPanel({ title, value, onChange, error, disabled = false }: { title:
       {error && <div className="inline-error"><strong>解析失败：</strong>{error.error}<details><summary>查看原始输出</summary><pre>{error.raw}</pre></details></div>}
       {!value && !error ? <div className="empty-panel">对话结束后在此生成</div> : editing ? (
         <div><textarea className="json-editor" value={draft} disabled={disabled} onChange={(event) => setDraft(event.target.value)} />{editError && <p className="field-error">{editError}</p>}<button className="primary small" disabled={disabled} onClick={save}>保存 JSON</button></div>
-      ) : value ? <pre className="json-view">{rendered}</pre> : null}
+      ) : value ? (
+        mode === "read"
+          ? <div className="json-read-view"><JsonReadableView value={value} kind={displayKind} /></div>
+          : <pre className="json-view">{rendered}</pre>
+      ) : null}
     </section>
   );
 }
@@ -733,6 +752,76 @@ function DirectChatPanel({ role, state, busy, disabled, error, onNew, onSelect, 
   </section>;
 }
 
+function agentFileUrl(role: AgentRole, fileId: string, mode: "preview" | "download"): string {
+  const query = new URLSearchParams({ role });
+  if (mode === "download") query.set("download", "1");
+  else query.set("preview", "1");
+  return `/api/files/${fileId}?${query.toString()}`;
+}
+
+function isPdfPreviewFile(file: AgentFileRecord): boolean {
+  return file.originalName.toLowerCase().endsWith(".pdf");
+}
+
+function isTextPreviewFile(file: AgentFileRecord): boolean {
+  const extension = file.originalName.split(".").pop()?.toLowerCase() || "";
+  return ["txt", "md", "markdown", "csv"].includes(extension);
+}
+
+function canOpenFilePreview(file: AgentFileRecord): boolean {
+  return file.status === "ready" && (isPdfPreviewFile(file) || isTextPreviewFile(file));
+}
+
+function FilePreviewModal({
+  role,
+  file,
+  textContent,
+  textLoading,
+  textError,
+  onClose,
+}: {
+  role: AgentRole;
+  file: AgentFileRecord;
+  textContent: string | null;
+  textLoading: boolean;
+  textError: string;
+  onClose: () => void;
+}) {
+  const previewUrl = agentFileUrl(role, file.id, "preview");
+  const downloadUrl = agentFileUrl(role, file.id, "download");
+  const pdf = isPdfPreviewFile(file);
+  const text = isTextPreviewFile(file);
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section className="modal file-preview-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <p>FILE PREVIEW</p>
+            <h2>{file.originalName}</h2>
+          </div>
+          <button type="button" onClick={onClose}>×</button>
+        </div>
+        <div className="file-preview-body">
+          {pdf ? <iframe title={file.originalName} src={previewUrl} /> : null}
+          {text && textLoading ? <div className="file-preview-placeholder">正在加载文件内容…</div> : null}
+          {text && textError ? <div className="inline-error">{textError}</div> : null}
+          {text && !textLoading && !textError ? <pre className="file-preview-text">{textContent || "（空文件）"}</pre> : null}
+          {!pdf && !text ? (
+            <div className="file-preview-placeholder">
+              此格式暂不支持在线预览，请下载后在本地查看。
+            </div>
+          ) : null}
+        </div>
+        <div className="modal-foot">
+          <span>{formatBytes(file.size)} · {file.status === "ready" ? `${file.chunkCount} 个检索片段` : file.status}</span>
+          <a className="primary-link" href={downloadUrl} download={file.originalName}>下载到本地</a>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function AgentFilePanel({ role, files, disabled, onFilesChange }: {
   role: AgentRole;
   files: AgentFileRecord[];
@@ -741,7 +830,48 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
 }) {
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
+  const [previewFile, setPreviewFile] = useState<AgentFileRecord | null>(null);
+  const [previewTextContent, setPreviewTextContent] = useState<string | null>(null);
+  const [previewTextLoading, setPreviewTextLoading] = useState(false);
+  const [previewTextError, setPreviewTextError] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+
+  function closePreview() {
+    setPreviewFile(null);
+    setPreviewTextContent(null);
+    setPreviewTextLoading(false);
+    setPreviewTextError("");
+  }
+
+  async function openFile(file: AgentFileRecord) {
+    if (isPdfPreviewFile(file)) {
+      setPreviewFile(file);
+      setPreviewTextContent(null);
+      setPreviewTextLoading(false);
+      setPreviewTextError("");
+      return;
+    }
+    if (isTextPreviewFile(file)) {
+      setPreviewFile(file);
+      setPreviewTextContent(null);
+      setPreviewTextLoading(true);
+      setPreviewTextError("");
+      try {
+        const response = await fetch(agentFileUrl(role, file.id, "preview"), { cache: "no-store" });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(typeof data.error === "string" ? data.error : "读取文件失败");
+        }
+        setPreviewTextContent(await response.text());
+      } catch (caught) {
+        setPreviewTextError(caught instanceof Error ? caught.message : "读取文件失败");
+      } finally {
+        setPreviewTextLoading(false);
+      }
+      return;
+    }
+    window.open(agentFileUrl(role, file.id, "download"), "_blank", "noopener,noreferrer");
+  }
 
   async function refresh(uploadedIds: string[] = []) {
     const response = await fetch(`/api/files?role=${role}`, { cache: "no-store" });
@@ -796,11 +926,28 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
       <div className="file-list">
         {files.length ? files.map((file) => <article key={file.id}>
           <div className={`file-icon ${file.status}`}>{file.originalName.split(".").pop()?.slice(0, 4).toUpperCase()}</div>
-          <div className="file-info"><strong title={file.originalName}>{file.originalName}</strong><span>{formatBytes(file.size)} · {file.status === "ready" ? `${file.chunkCount} 个检索片段` : file.status === "processing" ? "处理中" : "解析失败"}</span>{file.error && <em>{file.error}</em>}</div>
-          <span className={`file-status ${file.status}`}>{file.status === "ready" ? "可检索" : file.status === "processing" ? "处理中" : "失败"}</span>
-          <button disabled={disabled || working} onClick={() => remove(file)}>删除</button>
+          <div className="file-info">
+            <button type="button" className="file-link" title={file.originalName} onClick={() => void openFile(file)}>{file.originalName}</button>
+            <span>{formatBytes(file.size)} · {file.status === "ready" ? `${file.chunkCount} 个检索片段` : file.status === "processing" ? "处理中" : "解析失败"} · <span className={`file-status ${file.status}`}>{file.status === "ready" ? "可检索" : file.status === "processing" ? "处理中" : "失败"}</span></span>
+            {file.error && <em>{file.error}</em>}
+          </div>
+          <div className="file-actions">
+            {canOpenFilePreview(file) ? <button type="button" disabled={working} onClick={() => void openFile(file)}>预览</button> : null}
+            <a href={agentFileUrl(role, file.id, "download")} download={file.originalName}>下载</a>
+            <button type="button" disabled={disabled || working} onClick={() => remove(file)}>删除</button>
+          </div>
         </article>) : <div className="empty-file-list">尚未上传文件。没有文件时，工具会返回空结果。</div>}
       </div>
+      {previewFile ? (
+        <FilePreviewModal
+          role={role}
+          file={previewFile}
+          textContent={previewTextContent}
+          textLoading={previewTextLoading}
+          textError={previewTextError}
+          onClose={closePreview}
+        />
+      ) : null}
     </div>
   </details>;
 }
@@ -894,7 +1041,7 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
       </section>
       <section className="agent-module files-module"><div className="module-heading"><div><strong>私有文件与工具</strong><span>详细材料由本 Agent 按问题检索，不公开给对方</span></div><span className="visibility-badge private">仅本 Agent</span></div><AgentFilePanel role={role} files={files} disabled={filesDisabled} onFilesChange={onFilesChange} /></section>
       <section className="agent-module prompts-module"><div className="module-heading"><div><strong>五层提示词</strong><span>动态层适合放不愿直接公开的限制与临时状态；不会进入 Agent Card</span></div><span>按固定顺序组合</span></div>{(Object.keys(LAYER_LABELS) as LayerKey[]).map((key) => <PromptLayerEditor key={key} role={role} layerKey={key} agent={agent} onChange={update} />)}</section>
-      <section className="agent-module memory-module"><div className="module-heading"><div><strong>当前私有记忆</strong><span>不会发送给对方 Agent</span></div><span className="visibility-badge private">仅本 Agent</span></div><div className="private-memory"><JsonPanel title={`${ROLE_LABEL[role]}私有记忆`} value={memory} onChange={onMemory} disabled={filesDisabled} /></div></section>
+      <section className="agent-module memory-module"><div className="module-heading"><div><strong>当前私有记忆</strong><span>不会发送给对方 Agent</span></div><span className="visibility-badge private">仅本 Agent</span></div><div className="private-memory"><JsonPanel title={`${ROLE_LABEL[role]}私有记忆`} value={memory} onChange={onMemory} disabled={filesDisabled} displayKind={role === "investor" ? "investor_memory" : "founder_memory"} /></div></section>
       <DirectChatPanel key={`${role}-${agent.id}-${chatState.activeThreadId || "none"}`} role={role} state={chatState} busy={chatBusy} disabled={chatDisabled} error={chatError} onNew={onNewChat} onSelect={onSelectChat} onDelete={onDeleteChat} onSend={onSendChat} onPreviewCall={onPreviewChatCall} onPreviewPrompt={onPreviewChatPrompt} />
     </section>
   );
@@ -2210,9 +2357,9 @@ export default function DemoApp() {
             </details>
           </div>
           <div className="results-grid">
-            <JsonPanel title="公共匹配结果" value={publicResult} onChange={(value) => updateStoredResult("public", value)} error={rawErrors.public} disabled={modelBusy} />
-            <JsonPanel title="投资人私有记忆" value={investorMemory} onChange={(value) => updateStoredResult("investorMemory", value)} error={rawErrors.investorMemory} disabled={modelBusy} />
-            <JsonPanel title="创业者私有记忆" value={founderMemory} onChange={(value) => updateStoredResult("founderMemory", value)} error={rawErrors.founderMemory} disabled={modelBusy} />
+            <JsonPanel title="公共匹配结果" value={publicResult} onChange={(value) => updateStoredResult("public", value)} error={rawErrors.public} disabled={modelBusy} displayKind="public_evaluation" />
+            <JsonPanel title="投资人私有记忆" value={investorMemory} onChange={(value) => updateStoredResult("investorMemory", value)} error={rawErrors.investorMemory} disabled={modelBusy} displayKind="investor_memory" />
+            <JsonPanel title="创业者私有记忆" value={founderMemory} onChange={(value) => updateStoredResult("founderMemory", value)} error={rawErrors.founderMemory} disabled={modelBusy} displayKind="founder_memory" />
           </div>
         </div>}
         {tab === "daily" && <div className="daily-layout">
@@ -2241,7 +2388,7 @@ export default function DemoApp() {
                   <pre>{currentDailyPrompt}</pre>
                 </details>
                 <div className="daily-actions"><label>最大输出 Token<input type="number" min={64} max={16000} value={report.maxTokens} onChange={(event) => persistConfig({ ...config, dailyReport: { ...config.dailyReport, [role]: { ...report, maxTokens: Number(event.target.value) } } })} /></label><button onClick={() => setPromptModal({ title: `${ROLE_LABEL[role]}日报 · 当前完整五层系统提示词`, content: currentDailyPrompt })}>放大查看当前提示词</button><button disabled={!actual} onClick={() => actual && setPromptModal({ title: `${ROLE_LABEL[role]}日报 · 本次实际完整请求`, content: formatModelRequest(actual.messages) })}>查看本次完整请求</button><button onClick={() => persistConfig({ ...config, dailyReport: { ...config.dailyReport, [role]: clone(DEFAULT_CONFIG.dailyReport[role]) } })}>恢复默认</button></div>
-                <JsonPanel title={`${ROLE_LABEL[role]}日报`} value={dailyReports[role]} onChange={(value) => updateStoredDailyReport(role, value)} disabled={modelBusy} />
+                <JsonPanel title={`${ROLE_LABEL[role]}日报`} value={dailyReports[role]} onChange={(value) => updateStoredDailyReport(role, value)} disabled={modelBusy} displayKind={role === "investor" ? "investor_daily_report" : "founder_daily_report"} />
               </section>;
             })}
           </div>

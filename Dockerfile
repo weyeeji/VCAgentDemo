@@ -21,6 +21,8 @@ RUN groupadd --system --gid 1001 nodejs && useradd --system --uid 1001 --gid nod
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --chown=nextjs:nodejs data ./data
+COPY --chown=nextjs:nodejs output ./output
 USER nextjs
 EXPOSE 3000
 VOLUME ["/app/data"]

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentFileRecord, AgentRole, FileSearchResult } from "./types";
@@ -188,6 +188,44 @@ export async function deleteAgentFile(role: AgentRole, fileId: string): Promise<
   db().prepare("DELETE FROM agent_files WHERE id = ? AND agent_role = ?").run(fileId, role);
   await rm(path.dirname(row.stored_path), { recursive: true, force: true });
   return true;
+}
+
+function isValidFileId(fileId: string): boolean {
+  return /^[0-9a-f-]{36}$/i.test(fileId);
+}
+
+export function contentTypeForFile(record: AgentFileRecord): string {
+  const extension = path.extname(record.originalName).toLowerCase();
+  const mapping: Record<string, string> = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".markdown": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+  };
+  return mapping[extension] || record.mimeType || "application/octet-stream";
+}
+
+export function canPreviewFileInline(record: AgentFileRecord): boolean {
+  const extension = path.extname(record.originalName).toLowerCase();
+  return [".pdf", ".txt", ".md", ".markdown", ".csv"].includes(extension);
+}
+
+export async function readAgentFile(
+  role: AgentRole,
+  fileId: string,
+): Promise<{ record: AgentFileRecord; buffer: Buffer } | null> {
+  await initializeFileStore();
+  if (!isValidFileId(fileId)) return null;
+  const row = db().prepare("SELECT * FROM agent_files WHERE id = ? AND agent_role = ?").get(fileId, role) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  try {
+    const buffer = await readFile(String(row.stored_path));
+    return { record: mapFile(row), buffer };
+  } catch {
+    return null;
+  }
 }
 
 function searchTerms(query: string): string[] {

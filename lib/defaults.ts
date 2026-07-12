@@ -9,6 +9,7 @@ import type {
   RunSettings,
   UserProfileLibrary,
 } from "./types";
+import { demoSeedFileIdsByProfile } from "./demo-seed-manifest";
 
 export const LAYER_LABELS: Record<LayerKey, string> = {
   platform: "平台层",
@@ -442,7 +443,7 @@ export const DEFAULT_USER_PROFILES: UserProfileLibrary = freezeDeep({
       kind: "preset",
       fields: JSON.parse(JSON.stringify(investor.fields)) as Record<string, string>,
       dynamicLayer: JSON.parse(JSON.stringify(investor.prompts.dynamic)) as PromptLayer,
-      fileIds: [],
+      fileIds: demoSeedFileIdsByProfile(investor.id),
       memory: null,
       dailyReport: null,
       createdAt: DEFAULT_PROFILE_TIMESTAMP,
@@ -455,7 +456,7 @@ export const DEFAULT_USER_PROFILES: UserProfileLibrary = freezeDeep({
       kind: "preset",
       fields: medicalInvestorFields,
       dynamicLayer: emptyProfileDynamicLayer(),
-      fileIds: [],
+      fileIds: demoSeedFileIdsByProfile("investor-demo-002"),
       memory: null,
       dailyReport: null,
       createdAt: DEFAULT_PROFILE_TIMESTAMP,
@@ -470,7 +471,7 @@ export const DEFAULT_USER_PROFILES: UserProfileLibrary = freezeDeep({
       kind: "preset",
       fields: JSON.parse(JSON.stringify(founder.fields)) as Record<string, string>,
       dynamicLayer: JSON.parse(JSON.stringify(founder.prompts.dynamic)) as PromptLayer,
-      fileIds: [],
+      fileIds: demoSeedFileIdsByProfile(founder.id),
       memory: null,
       dailyReport: null,
       createdAt: DEFAULT_PROFILE_TIMESTAMP,
@@ -483,7 +484,7 @@ export const DEFAULT_USER_PROFILES: UserProfileLibrary = freezeDeep({
       kind: "preset",
       fields: medicalFounderFields,
       dynamicLayer: emptyProfileDynamicLayer(),
-      fileIds: [],
+      fileIds: demoSeedFileIdsByProfile("founder-demo-002"),
       memory: null,
       dailyReport: null,
       createdAt: DEFAULT_PROFILE_TIMESTAMP,

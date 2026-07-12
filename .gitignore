@@ -28,18 +28,24 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
-.env*
+# env files
+.env
+.env.*
 !.env.example
 
 # vercel
 .vercel
 
-# typescript
+# typescript build artifacts
 next-env.d.ts
 *.tsbuildinfo
 /dist/
 /.wrangler/
-/outputs/
+
+# local scratch only
 /work/
-/data/
+.venv-pdf/
+
+# sqlite runtime sidecars
+*.db-shm
+*.db-wal

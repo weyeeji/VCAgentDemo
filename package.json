@@ -10,7 +10,9 @@
     "build": "next build",
     "start": "node .next/standalone/server.js",
     "test": "npm run lint && npm run build",
-    "lint": "eslint . --ignore-pattern .next --ignore-pattern dist"
+    "lint": "eslint . --ignore-pattern .next --ignore-pattern dist",
+    "generate:pdfs": ".venv-pdf/bin/python scripts/generate_test_pdfs.py || python3 scripts/generate_test_pdfs.py",
+    "seed": "tsx scripts/seed-demo-data.ts"
   },
   "dependencies": {
     "mammoth": "1.12.0",
@@ -27,6 +29,7 @@
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
     "tailwindcss": "4.2.1",
+    "tsx": "^4.23.0",
     "typescript": "5.9.3"
   },
   "overrides": {

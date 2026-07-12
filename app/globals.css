@@ -100,7 +100,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--indigo); box-sha
 .price-settings summary { cursor: pointer; margin-bottom: 7px; }
 .price-settings[open] { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .price-settings[open] summary { grid-column: 1 / -1; }
-.run-buttons { display: flex; flex-wrap: wrap; gap: 7px; }
+.run-buttons { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
 .run-buttons button { background: white; color: #4d5667; border-color: var(--line-strong); }
 .primary, .run-buttons .primary { border-color: var(--indigo) !important; background: var(--indigo) !important; color: white !important; }
 .danger, .run-buttons .danger { border-color: #e7c4c8 !important; background: #fff5f5 !important; color: var(--danger) !important; }

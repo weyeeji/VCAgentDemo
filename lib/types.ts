@@ -83,6 +83,32 @@ export interface TurnMessage {
   createdAt: string;
 }
 
+export interface DemoAgentCard {
+  format: "a2a-inspired";
+  referenceVersion: "1.0";
+  agentId: string;
+  name: string;
+  description: string;
+  version: string;
+  capabilities: {
+    streaming: boolean;
+    pushNotifications: boolean;
+    extendedAgentCard: boolean;
+  };
+  defaultInputModes: string[];
+  defaultOutputModes: string[];
+  skills: Array<{
+    id: string;
+    name: string;
+    description: string;
+    tags: string[];
+  }>;
+  publicIdentity: {
+    role: AgentRole;
+    claims: Record<string, string>;
+  };
+}
+
 export interface DebugCall {
   id: string;
   type:
@@ -93,6 +119,8 @@ export interface DebugCall {
     | "founder_memory"
     | "investor_daily_report"
     | "founder_daily_report"
+    | "investor_direct_chat"
+    | "founder_direct_chat"
     | "json_repair";
   actor: "investor" | "founder" | "evaluator" | "system";
   round: number | null;
@@ -148,12 +176,49 @@ export interface ToolExecutionTrace {
   error: string | null;
 }
 
+export interface DirectChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+  callId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  usageEstimated: boolean;
+  estimatedCost: number;
+  toolCalls: ToolExecutionTrace[];
+}
+
+export interface DirectChatThread {
+  id: string;
+  agentRole: AgentRole;
+  createdAt: string;
+  updatedAt: string;
+  agentSnapshot: AgentProfile;
+  settingsSnapshot: RunSettings;
+  promptSnapshot: string;
+  jsonRepairPromptSnapshot: string;
+  counterpartyAgentCardSnapshot: DemoAgentCard;
+  fileSnapshots: AgentFileRecord[];
+  messages: DirectChatMessage[];
+  debugCalls: DebugCall[];
+  errors: string[];
+}
+
+export interface DirectChatRoleState {
+  activeThreadId: string | null;
+  threads: DirectChatThread[];
+}
+
+export type DirectChatState = Record<AgentRole, DirectChatRoleState>;
+
 export interface SimulationRecord {
   conversationId: string;
   createdAt: string;
   completedAt: string | null;
   configVersion: string | null;
   configSnapshot: AppConfig;
+  agentCardSnapshots: Record<AgentRole, DemoAgentCard>;
   promptSnapshots: { investor: string; founder: string };
   fileSnapshots: Record<AgentRole, AgentFileRecord[]>;
   memorySnapshots: Record<AgentRole, unknown | null>;
@@ -183,6 +248,7 @@ export interface WorkspaceState {
   config: AppConfig;
   versions: SavedVersion[];
   records: SimulationRecord[];
+  directChats: DirectChatState;
   memories: Record<AgentRole, unknown | null>;
   dailyReports: Record<AgentRole, unknown | null>;
   activeVersion: string | null;
@@ -191,7 +257,7 @@ export interface WorkspaceState {
 }
 
 export type WorkspaceStatePatch = Partial<Pick<WorkspaceState,
-  "config" | "versions" | "records" | "memories" | "dailyReports" | "activeVersion" | "activeRecordId"
+  "config" | "versions" | "records" | "directChats" | "memories" | "dailyReports" | "activeVersion" | "activeRecordId"
 >>;
 
 export type FieldInputType = "text" | "textarea" | "select" | "multiselect" | "date";

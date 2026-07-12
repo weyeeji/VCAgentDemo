@@ -102,6 +102,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--indigo); box-sha
 .price-settings[open] summary { grid-column: 1 / -1; }
 .run-buttons { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
 .run-buttons button { background: white; color: #4d5667; border-color: var(--line-strong); }
+.run-block-reason { margin: -4px 0 12px; padding: 8px 10px; border-radius: 7px; background: #fff7eb; border: 1px solid #f0d7a8; color: #8a5a12; font-size: 12px; line-height: 1.45; }
 .primary, .run-buttons .primary { border-color: var(--indigo) !important; background: var(--indigo) !important; color: white !important; }
 .danger, .run-buttons .danger { border-color: #e7c4c8 !important; background: #fff5f5 !important; color: var(--danger) !important; }
 .wide { width: 100%; min-height: 44px; border: 0; border-radius: 7px; }

@@ -598,6 +598,14 @@ export function getWorkspaceState(): WorkspaceState {
   return readState(db());
 }
 
+function stripProfilesSessionData(profiles: UserProfileLibrary): UserProfileLibrary {
+  const next = clone(profiles);
+  (["investor", "founder"] as const).forEach((role) => {
+    next[role] = next[role].map((profile) => ({ ...profile, memory: null, dailyReport: null }));
+  });
+  return next;
+}
+
 export function validateWorkspacePatch(value: unknown): WorkspaceStatePatch {
   if (!isObject(value)) throw new Error("请求体必须是 JSON 对象。");
   const allowed = new Set(["config", "profiles", "versions", "records", "directChats", "memories", "dailyReports", "activeVersion", "activeRecordId"]);
@@ -614,7 +622,7 @@ export function validateWorkspacePatch(value: unknown): WorkspaceStatePatch {
     if (!isUserProfileLibrary(value.profiles)) {
       throw new Error(`profiles 结构无效；每个角色必须有 1–${MAX_USER_PROFILES_PER_ROLE} 套资料，且 Agent ID 必须唯一。`);
     }
-    patch.profiles = clone(value.profiles);
+    patch.profiles = stripProfilesSessionData(value.profiles);
   }
   if (Object.hasOwn(value, "versions")) {
     if (!Array.isArray(value.versions) || value.versions.length > MAX_VERSIONS || !value.versions.every(isStrictVersion)) {
@@ -622,25 +630,22 @@ export function validateWorkspacePatch(value: unknown): WorkspaceStatePatch {
     }
     patch.versions = clone(value.versions);
   }
+  // Session fields remain accepted for older clients but are ignored on save.
   if (Object.hasOwn(value, "records")) {
     if (!Array.isArray(value.records) || value.records.length > MAX_RECORDS || !value.records.every(isSimulationRecord)) {
       throw new Error(`records 必须是有效数组且不能超过 ${MAX_RECORDS} 条。`);
     }
-    patch.records = clone(value.records);
   }
   if (Object.hasOwn(value, "directChats")) {
     if (!isDirectChatState(value.directChats)) {
       throw new Error(`directChats 结构无效，且每个角色不能超过 ${MAX_DIRECT_CHAT_THREADS_PER_ROLE} 个对话。`);
     }
-    patch.directChats = clone(value.directChats);
   }
   if (Object.hasOwn(value, "memories")) {
     if (!isRolePair(value.memories)) throw new Error("memories 必须同时包含 investor 和 founder。");
-    patch.memories = clone(value.memories);
   }
   if (Object.hasOwn(value, "dailyReports")) {
     if (!isRolePair(value.dailyReports)) throw new Error("dailyReports 必须同时包含 investor 和 founder。");
-    patch.dailyReports = clone(value.dailyReports);
   }
   if (Object.hasOwn(value, "activeVersion")) {
     if (!isNullableId(value.activeVersion)) throw new Error("activeVersion 必须是字符串或 null。");
@@ -648,7 +653,13 @@ export function validateWorkspacePatch(value: unknown): WorkspaceStatePatch {
   }
   if (Object.hasOwn(value, "activeRecordId")) {
     if (!isNullableId(value.activeRecordId)) throw new Error("activeRecordId 必须是字符串或 null。");
-    patch.activeRecordId = value.activeRecordId;
+  }
+  const persistedKeys = Object.keys(patch);
+  // Older clients may send only session fields; treat that as a no-op clear trigger.
+  if (!persistedKeys.length) {
+    if (!Object.keys(value).some((key) => ["records", "directChats", "memories", "dailyReports", "activeRecordId"].includes(key))) {
+      throw new Error("至少提供一个需要保存的字段。");
+    }
   }
   if (JSON.stringify(patch).length > MAX_STATE_CHARS) throw new Error("保存内容过大。");
   return patch;
@@ -661,12 +672,14 @@ export function saveWorkspaceState(patch: WorkspaceStatePatch, expectedUpdatedAt
     const current = readState(database);
     if (current.updatedAt !== expectedUpdatedAt) throw new WorkspaceStateConflictError(current);
     const revision = nextRevision(current.updatedAt);
-    const merged = {
-      ...current,
-      ...clone(patch),
-    };
-    const profiles = normalizeProfiles(merged.profiles, merged.config, merged.memories, merged.dailyReports, revision);
-    const config = clone(merged.config);
+    const emptyMemories = { investor: null, founder: null };
+    const emptyDailyReports = { investor: null, founder: null };
+    const mergedConfig = patch.config ? clone(patch.config) : clone(current.config);
+    const mergedProfilesInput = patch.profiles ? clone(patch.profiles) : clone(current.profiles);
+    const profiles = stripProfilesSessionData(
+      normalizeProfiles(mergedProfilesInput, mergedConfig, emptyMemories, emptyDailyReports, revision),
+    );
+    const config = clone(mergedConfig);
     (["investor", "founder"] as const).forEach((role) => {
       const profile = profiles[role].find((item) => item.id === config[role].id) || profiles[role][0];
       config[role] = {
@@ -676,16 +689,17 @@ export function saveWorkspaceState(patch: WorkspaceStatePatch, expectedUpdatedAt
         prompts: { ...config[role].prompts, dynamic: clone(profile.dynamicLayer) },
       };
     });
-    const activeInvestor = profiles.investor.find((profile) => profile.id === config.investor.id) || profiles.investor[0];
-    const activeFounder = profiles.founder.find((profile) => profile.id === config.founder.id) || profiles.founder[0];
     const next: WorkspaceState = {
-      ...merged,
       schemaVersion: 1,
       config,
       profiles,
-      directChats: normalizeDirectChats(merged.directChats),
-      memories: { investor: clone(activeInvestor.memory), founder: clone(activeFounder.memory) },
-      dailyReports: { investor: clone(activeInvestor.dailyReport), founder: clone(activeFounder.dailyReport) },
+      versions: patch.versions ? clone(patch.versions) : clone(current.versions),
+      records: [],
+      directChats: emptyDirectChats(),
+      memories: emptyMemories,
+      dailyReports: emptyDailyReports,
+      activeVersion: patch.activeVersion !== undefined ? patch.activeVersion : current.activeVersion,
+      activeRecordId: null,
       // `updatedAt` also acts as the optimistic-concurrency revision. Keep it
       // strictly monotonic even when two writes land in the same millisecond.
       updatedAt: revision,

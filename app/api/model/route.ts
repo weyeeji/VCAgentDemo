@@ -34,11 +34,55 @@ interface Usage {
   total_tokens?: number;
 }
 
+interface UpstreamChoiceMessage {
+  content?: unknown;
+  reasoning_content?: unknown;
+  tool_calls?: unknown;
+}
+
 interface UpstreamResponse {
-  choices?: Array<{ message?: { content?: unknown; tool_calls?: unknown } }>;
+  choices?: Array<{ message?: UpstreamChoiceMessage; finish_reason?: unknown }>;
   usage?: Usage;
   model?: unknown;
   id?: unknown;
+}
+
+function extractAssistantContent(message: UpstreamChoiceMessage | undefined): string | null {
+  if (!message) return null;
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    const joined = message.content
+      .map((part) => {
+        if (!part || typeof part !== "object") return "";
+        const entry = part as { type?: unknown; text?: unknown };
+        return entry.type === "text" && typeof entry.text === "string" ? entry.text : "";
+      })
+      .join("");
+    if (joined) return joined;
+  }
+  return null;
+}
+
+function reasoningFallbackContent(message: UpstreamChoiceMessage | undefined): string | null {
+  if (!message || typeof message.reasoning_content !== "string") return null;
+  const reasoning = message.reasoning_content.trim();
+  if (!reasoning) return null;
+  const first = reasoning.indexOf("{");
+  const last = reasoning.lastIndexOf("}");
+  if (first >= 0 && last > first) return reasoning.slice(first, last + 1);
+  return reasoning;
+}
+
+function resolveAssistantContent(message: UpstreamChoiceMessage | undefined): string | null {
+  const content = extractAssistantContent(message);
+  if (content?.trim()) return content;
+  return reasoningFallbackContent(message);
+}
+
+function shouldDisableThinking(forceDisableThinking = false): boolean {
+  if (forceDisableThinking) return true;
+  const value = process.env.DISABLE_THINKING;
+  return value !== "0" && value !== "false";
 }
 
 class UpstreamError extends Error {
@@ -126,15 +170,19 @@ export async function POST(request: Request) {
   let requestId: string | null = null;
   let responseModel = model;
 
-  async function callUpstream(): Promise<{ data: UpstreamResponse; content: string | null; calls: ToolCall[] }> {
+  const baseMaxTokens = Math.min(16_000, Math.max(64, Number(body.maxTokens) || 800));
+
+  async function callUpstream(options?: { maxTokens?: number; forceDisableThinking?: boolean }): Promise<{ data: UpstreamResponse; content: string | null; calls: ToolCall[] }> {
+    const maxTokens = Math.min(16_000, Math.max(64, Number(options?.maxTokens) || baseMaxTokens));
     const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model,
         messages,
-        max_tokens: Math.min(16_000, Math.max(64, Number(body.maxTokens) || 800)),
+        max_tokens: maxTokens,
         response_format: { type: "json_object" },
+        ...(shouldDisableThinking(options?.forceDisableThinking) ? { enable_thinking: false } : {}),
         ...(toolsEnabled ? { tools: [PRIVATE_FILE_TOOL], tool_choice: "auto" } : {}),
       }),
       signal: controller.signal,
@@ -155,15 +203,33 @@ export async function POST(request: Request) {
     if (typeof data.id === "string") requestId = data.id;
     if (typeof data.model === "string") responseModel = data.model;
     const message = data.choices?.[0]?.message;
-    const content = typeof message?.content === "string" ? message.content : null;
+    const content = resolveAssistantContent(message);
     const calls = parseToolCalls(message?.tool_calls);
-    trace.push({ stage: calls.length ? "tool_request" : "final", content, tool_calls: calls, usage: data.usage || null });
+    trace.push({
+      stage: calls.length ? "tool_request" : "final",
+      content,
+      finish_reason: data.choices?.[0]?.finish_reason ?? null,
+      tool_calls: calls,
+      usage: data.usage || null,
+    });
     return { data, content, calls };
+  }
+
+  async function callUpstreamWithRetry(): Promise<{ data: UpstreamResponse; content: string | null; calls: ToolCall[] }> {
+    let upstream = await callUpstream();
+    if (!upstream.calls.length && !upstream.content?.trim()) {
+      upstream = await callUpstream({
+        maxTokens: Math.min(16_000, Math.max(baseMaxTokens * 4, 2048)),
+        forceDisableThinking: true,
+      });
+      trace.push({ stage: "empty_content_retry", content: upstream.content, tool_calls: upstream.calls });
+    }
+    return upstream;
   }
 
   try {
     for (let toolRound = 0; toolRound <= 2; toolRound += 1) {
-      const upstream = await callUpstream();
+      const upstream = await callUpstreamWithRetry();
       if (!upstream.calls.length) {
         if (!upstream.content?.trim()) return error("模型返回空内容", "未收到可用的消息内容。", 502);
         return Response.json({

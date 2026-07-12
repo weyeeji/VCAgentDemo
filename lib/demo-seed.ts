@@ -69,15 +69,33 @@ async function importSeedFile(
 
 /**
  * 若模拟 PDF 尚未入库，则从 output/pdf 自动导入。
+ * 若已入库但 stored_path 指向其他机器的绝对路径（常见于拷贝 data/），则就地修复。
  * 启动后首次访问文件/工作区时会执行，保证服务器拉代码即可看到默认资料。
  */
 export async function ensureDemoSeedFiles(database: DatabaseSync, uploadDir: string, pdfDir: string): Promise<void> {
   await mkdir(uploadDir, { recursive: true });
   let imported = false;
+  let repaired = false;
   for (const spec of DEMO_SEED_FILES) {
-    const existing = database.prepare("SELECT id FROM agent_files WHERE id = ? AND agent_role = ? AND status = 'ready'")
-      .get(spec.id, spec.role) as { id: string } | undefined;
-    if (existing) continue;
+    const existing = database.prepare("SELECT id, stored_path FROM agent_files WHERE id = ? AND agent_role = ? AND status = 'ready'")
+      .get(spec.id, spec.role) as { id: string; stored_path: string } | undefined;
+    if (existing) {
+      const expectedPath = path.join(uploadDir, spec.role, spec.id, "source.pdf");
+      try {
+        await access(existing.stored_path);
+        continue;
+      } catch {
+        try {
+          await access(expectedPath);
+          database.prepare("UPDATE agent_files SET stored_path = ? WHERE id = ? AND agent_role = ?")
+            .run(expectedPath, spec.id, spec.role);
+          repaired = true;
+          continue;
+        } catch {
+          // fall through to re-import from output/pdf
+        }
+      }
+    }
     try {
       await access(path.join(pdfDir, spec.pdfName));
     } catch {
@@ -88,5 +106,8 @@ export async function ensureDemoSeedFiles(database: DatabaseSync, uploadDir: str
   }
   if (imported) {
     console.info("[demo-seed] imported missing preset PDF fixtures");
+  }
+  if (repaired) {
+    console.info("[demo-seed] repaired stale stored_path for preset PDF fixtures");
   }
 }

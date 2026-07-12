@@ -48,7 +48,18 @@ const LEGACY_CONFIG_KEY = "vc-agent-debugger:config:v1";
 const LEGACY_VERSION_KEY = "vc-agent-debugger:versions:v1";
 const LEGACY_RECORD_KEY = "vc-agent-debugger:records:v1";
 const LEGACY_STORAGE_KEYS = [LEGACY_CONFIG_KEY, LEGACY_VERSION_KEY, LEGACY_RECORD_KEY] as const;
-const WORKSPACE_PATCH_KEYS = ["config", "profiles", "versions", "records", "memories", "dailyReports", "directChats", "activeVersion", "activeRecordId"] as const;
+const SESSION_STORAGE_KEY = "vc-agent-debugger:session:v1";
+const SERVER_PATCH_KEYS = ["config", "profiles", "versions", "activeVersion"] as const;
+type ServerPatchKey = (typeof SERVER_PATCH_KEYS)[number];
+type LocalSessionState = {
+  records: SimulationRecord[];
+  memories: Record<AgentRole, unknown | null>;
+  dailyReports: Record<AgentRole, unknown | null>;
+  directChats: DirectChatState;
+  activeRecordId: string | null;
+  activeProfileIds: Record<AgentRole, string | null>;
+  profileSessions: Record<AgentRole, Array<{ id: string; memory: unknown | null; dailyReport: unknown | null }>>;
+};
 const ROLE_LABEL: Record<AgentRole, string> = { investor: "投资人", founder: "创业者" };
 
 type RunStatus = "idle" | "running" | "paused" | "stopping" | "postprocessing" | "completed" | "error";
@@ -64,6 +75,171 @@ function emptyDirectChats(): DirectChatState {
     investor: { activeThreadId: null, threads: [] },
     founder: { activeThreadId: null, threads: [] },
   };
+}
+
+function emptyLocalSession(): LocalSessionState {
+  return {
+    records: [],
+    memories: { investor: null, founder: null },
+    dailyReports: { investor: null, founder: null },
+    directChats: emptyDirectChats(),
+    activeRecordId: null,
+    activeProfileIds: { investor: null, founder: null },
+    profileSessions: { investor: [], founder: [] },
+  };
+}
+
+function applyActiveProfileSelection(
+  config: AppConfig,
+  library: UserProfileLibrary,
+  activeProfileIds: Record<AgentRole, string | null>,
+): AppConfig {
+  const next = clone(config);
+  (["investor", "founder"] as AgentRole[]).forEach((role) => {
+    const profileId = activeProfileIds[role];
+    if (!profileId) return;
+    const profile = library[role].find((item) => item.id === profileId);
+    if (!profile) return;
+    next[role] = {
+      ...next[role],
+      id: profile.id,
+      fields: clone(profile.fields),
+      prompts: { ...next[role].prompts, dynamic: clone(profile.dynamicLayer) },
+    };
+  });
+  return next;
+}
+
+function configForServerPersist(localConfig: AppConfig, serverConfigJson?: string): AppConfig {
+  if (!serverConfigJson) return clone(localConfig);
+  try {
+    const serverConfig = migrateConfig(JSON.parse(serverConfigJson) as AppConfig);
+    return {
+      ...clone(localConfig),
+      // Active agent selection is per-browser; do not overwrite the shared workspace agents.
+      investor: clone(serverConfig.investor),
+      founder: clone(serverConfig.founder),
+    };
+  } catch {
+    return clone(localConfig);
+  }
+}
+
+function stripProfilesSessionData(library: UserProfileLibrary): UserProfileLibrary {
+  const next = clone(library);
+  (["investor", "founder"] as AgentRole[]).forEach((role) => {
+    next[role] = next[role].map((profile) => ({ ...profile, memory: null, dailyReport: null }));
+  });
+  return next;
+}
+
+function extractProfileSessions(library: UserProfileLibrary): LocalSessionState["profileSessions"] {
+  return {
+    investor: library.investor.map((profile) => ({ id: profile.id, memory: clone(profile.memory), dailyReport: clone(profile.dailyReport) })),
+    founder: library.founder.map((profile) => ({ id: profile.id, memory: clone(profile.memory), dailyReport: clone(profile.dailyReport) })),
+  };
+}
+
+function applyProfileSessions(library: UserProfileLibrary, sessions: LocalSessionState["profileSessions"]): UserProfileLibrary {
+  const next = clone(library);
+  (["investor", "founder"] as AgentRole[]).forEach((role) => {
+    const byId = new Map(sessions[role].map((item) => [item.id, item]));
+    next[role] = next[role].map((profile) => {
+      const session = byId.get(profile.id);
+      if (!session) return { ...profile, memory: null, dailyReport: null };
+      return { ...profile, memory: clone(session.memory), dailyReport: clone(session.dailyReport) };
+    });
+  });
+  return next;
+}
+
+function isLocalSessionEmpty(session: LocalSessionState): boolean {
+  return !session.records.length
+    && session.memories.investor == null && session.memories.founder == null
+    && session.dailyReports.investor == null && session.dailyReports.founder == null
+    && !session.directChats.investor.threads.length && !session.directChats.founder.threads.length
+    && !session.activeRecordId
+    && session.profileSessions.investor.every((item) => item.memory == null && item.dailyReport == null)
+    && session.profileSessions.founder.every((item) => item.memory == null && item.dailyReport == null);
+}
+
+function readLocalSession(): LocalSessionState | null {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<LocalSessionState>;
+    const records = Array.isArray(parsed.records) ? normalizeLegacyRecords(parsed.records).items : [];
+    const memories = parsed.memories && typeof parsed.memories === "object"
+      ? { investor: (parsed.memories as Record<string, unknown>).investor ?? null, founder: (parsed.memories as Record<string, unknown>).founder ?? null }
+      : { investor: null, founder: null };
+    const dailyReports = parsed.dailyReports && typeof parsed.dailyReports === "object"
+      ? { investor: (parsed.dailyReports as Record<string, unknown>).investor ?? null, founder: (parsed.dailyReports as Record<string, unknown>).founder ?? null }
+      : { investor: null, founder: null };
+    const directChats = parsed.directChats && typeof parsed.directChats === "object"
+      ? clone(parsed.directChats as DirectChatState)
+      : emptyDirectChats();
+    const activeRecordId = typeof parsed.activeRecordId === "string" || parsed.activeRecordId === null
+      ? parsed.activeRecordId
+      : null;
+    const activeProfileIds = parsed.activeProfileIds && typeof parsed.activeProfileIds === "object"
+      ? {
+        investor: typeof (parsed.activeProfileIds as Record<string, unknown>).investor === "string"
+          ? (parsed.activeProfileIds as Record<AgentRole, string | null>).investor
+          : null,
+        founder: typeof (parsed.activeProfileIds as Record<string, unknown>).founder === "string"
+          ? (parsed.activeProfileIds as Record<AgentRole, string | null>).founder
+          : null,
+      }
+      : { investor: null, founder: null };
+    const profileSessions = parsed.profileSessions && typeof parsed.profileSessions === "object"
+      ? {
+        investor: Array.isArray((parsed.profileSessions as LocalSessionState["profileSessions"]).investor)
+          ? (parsed.profileSessions as LocalSessionState["profileSessions"]).investor
+          : [],
+        founder: Array.isArray((parsed.profileSessions as LocalSessionState["profileSessions"]).founder)
+          ? (parsed.profileSessions as LocalSessionState["profileSessions"]).founder
+          : [],
+      }
+      : { investor: [], founder: [] };
+    return { records, memories, dailyReports, directChats, activeRecordId, activeProfileIds, profileSessions };
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalSession(session: LocalSessionState): void {
+  localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+}
+
+function localSessionFromWorkspace(
+  records: SimulationRecord[],
+  memories: Record<AgentRole, unknown | null>,
+  dailyReports: Record<AgentRole, unknown | null>,
+  directChats: DirectChatState,
+  activeRecordId: string | null,
+  profiles: UserProfileLibrary,
+  activeProfileIds: Record<AgentRole, string | null>,
+): LocalSessionState {
+  return {
+    records: records.slice(0, 20),
+    memories: clone(memories),
+    dailyReports: clone(dailyReports),
+    directChats: clone(directChats),
+    activeRecordId,
+    activeProfileIds: { investor: activeProfileIds.investor, founder: activeProfileIds.founder },
+    profileSessions: extractProfileSessions(profiles),
+  };
+}
+
+function serverShapedSerialized(patch: WorkspaceStatePatch, serverConfigJson?: string): Record<string, string> {
+  const shaped: WorkspaceStatePatch = {};
+  if (patch.config !== undefined) shaped.config = configForServerPersist(patch.config, serverConfigJson);
+  if (patch.profiles !== undefined) shaped.profiles = stripProfilesSessionData(patch.profiles);
+  if (patch.versions !== undefined) shaped.versions = patch.versions;
+  if (patch.activeVersion !== undefined) shaped.activeVersion = patch.activeVersion;
+  return Object.fromEntries(
+    SERVER_PATCH_KEYS.filter((key) => shaped[key] !== undefined).map((key) => [key, JSON.stringify(shaped[key])]),
+  );
 }
 
 function activeUserProfile(library: UserProfileLibrary, config: AppConfig, role: AgentRole): UserProfileRecord {
@@ -139,8 +315,23 @@ function migrateLegacyProfiles(
   return next;
 }
 
+function createBrowserId(): string {
+  const webCrypto = typeof globalThis !== "undefined" ? globalThis.crypto : undefined;
+  if (webCrypto && typeof webCrypto.randomUUID === "function") return webCrypto.randomUUID();
+  // http://公网IP 不是安全上下文，randomUUID 不可用；getRandomValues 通常仍可用。
+  if (webCrypto && typeof webCrypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    webCrypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function id(prefix: string) {
-  return `${prefix}_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
+  return `${prefix}_${Date.now().toString(36)}_${createBrowserId().replaceAll("-", "").slice(0, 8)}`;
 }
 
 function profileFieldsKey(fields: Record<string, string>): string {
@@ -294,9 +485,13 @@ function normalizeLegacyRecords(value: unknown): { items: SimulationRecord[]; di
   return { items, discarded: value.length - items.length };
 }
 
-function serializedWorkspaceState(state: WorkspaceState): Record<string, string> {
-  const stateRecord = state as unknown as Record<string, unknown>;
-  return Object.fromEntries(WORKSPACE_PATCH_KEYS.map((key) => [key, JSON.stringify(stateRecord[key])]));
+function serializedServerWorkspaceState(state: WorkspaceState): Record<string, string> {
+  return {
+    config: JSON.stringify(state.config),
+    profiles: JSON.stringify(stripProfilesSessionData(state.profiles || deepCloneUserProfiles())),
+    versions: JSON.stringify(state.versions),
+    activeVersion: JSON.stringify(state.activeVersion),
+  };
 }
 
 function normalizedVariants(value: unknown, label: string): PromptVariant[] {
@@ -305,7 +500,7 @@ function normalizedVariants(value: unknown, label: string): PromptVariant[] {
   return value.flatMap((candidate, index) => {
     if (!isPlainObject(candidate) || typeof candidate.content !== "string") return [];
     let variantId = typeof candidate.id === "string" ? candidate.id.trim().slice(0, 200) : "";
-    if (!variantId || variantId.includes("\0") || seen.has(variantId)) variantId = `variant-${crypto.randomUUID()}`;
+    if (!variantId || variantId.includes("\0") || seen.has(variantId)) variantId = `variant-${createBrowserId()}`;
     seen.add(variantId);
     const rawName = typeof candidate.name === "string" ? candidate.name.trim().slice(0, 200) : "";
     const rawCreatedAt = typeof candidate.createdAt === "string" ? candidate.createdAt : "";
@@ -687,11 +882,12 @@ function AgentCardView({ role, card }: { role: AgentRole; card: DemoAgentCard })
   </section>;
 }
 
-function DirectChatPanel({ role, state, busy, disabled, error, onNew, onSelect, onDelete, onSend, onPreviewCall, onPreviewPrompt }: {
+function DirectChatPanel({ role, state, busy, disabled, newChatDisabled, error, onNew, onSelect, onDelete, onSend, onPreviewCall, onPreviewPrompt }: {
   role: AgentRole;
   state: DirectChatRoleState;
   busy: boolean;
   disabled: boolean;
+  newChatDisabled: boolean;
   error: string;
   onNew: () => void;
   onSelect: (threadId: string) => void;
@@ -718,7 +914,7 @@ function DirectChatPanel({ role, state, busy, disabled, error, onNew, onSelect, 
   return <section className="agent-module test-chat-module">
     <div className="direct-chat-head">
       <div><span className="visibility-badge private">用户测试 · 不限轮次</span><strong>与自己的{ROLE_LABEL[role]} Agent 对话</strong><em>沿用创建会话时冻结的本 Agent 五层提示词与本方私有文件工具</em></div>
-      <button disabled={disabled || busy} onClick={onNew}>＋ 创建新对话</button>
+      <button title={newChatDisabled || busy ? "模拟或模型任务进行中，请稍后再创建" : undefined} onClick={onNew}>＋ 创建新对话</button>
     </div>
     {state.threads.length > 0 && <div className="direct-chat-history">
       <label>当前对话<select value={active?.id || ""} disabled={disabled || busy} onChange={(event) => onSelect(event.target.value)}>{state.threads.map((thread, index) => <option key={thread.id} value={thread.id}>对话 {state.threads.length - index} · {new Date(thread.createdAt).toLocaleString("zh-CN")}</option>)}</select></label>
@@ -954,7 +1150,7 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
 }
 
 function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, files, filesDisabled, onFilesChange,
-  chatState, chatBusy, chatDisabled, chatError, onNewChat, onSelectChat, onDeleteChat, onSendChat, onPreviewChatCall, onPreviewChatPrompt,
+  chatState, chatBusy, chatDisabled, chatNewDisabled, chatError, onNewChat, onSelectChat, onDeleteChat, onSendChat, onPreviewChatCall, onPreviewChatPrompt,
   profileOptions, onSelectProfile, onCreateProfile, onProfileDirty, onSaveProfile,
 }: {
   role: AgentRole;
@@ -969,6 +1165,7 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
   chatState: DirectChatRoleState;
   chatBusy: boolean;
   chatDisabled: boolean;
+  chatNewDisabled: boolean;
   chatError: string;
   onNewChat: () => void;
   onSelectChat: (threadId: string) => void;
@@ -1043,7 +1240,7 @@ function AgentPanel({ role, config, onConfig, memory, onMemory, promptPreview, f
       <section className="agent-module files-module"><div className="module-heading"><div><strong>私有文件与工具</strong><span>详细材料由本 Agent 按问题检索，不公开给对方</span></div><span className="visibility-badge private">仅本 Agent</span></div><AgentFilePanel role={role} files={files} disabled={filesDisabled} onFilesChange={onFilesChange} /></section>
       <section className="agent-module prompts-module"><div className="module-heading"><div><strong>五层提示词</strong><span>动态层适合放不愿直接公开的限制与临时状态；不会进入 Agent Card</span></div><span>按固定顺序组合</span></div>{(Object.keys(LAYER_LABELS) as LayerKey[]).map((key) => <PromptLayerEditor key={key} role={role} layerKey={key} agent={agent} onChange={update} />)}</section>
       <section className="agent-module memory-module"><div className="module-heading"><div><strong>当前私有记忆</strong><span>不会发送给对方 Agent</span></div><span className="visibility-badge private">仅本 Agent</span></div><div className="private-memory"><JsonPanel title={`${ROLE_LABEL[role]}私有记忆`} value={memory} onChange={onMemory} disabled={filesDisabled} displayKind={role === "investor" ? "investor_memory" : "founder_memory"} /></div></section>
-      <DirectChatPanel key={`${role}-${agent.id}-${chatState.activeThreadId || "none"}`} role={role} state={chatState} busy={chatBusy} disabled={chatDisabled} error={chatError} onNew={onNewChat} onSelect={onSelectChat} onDelete={onDeleteChat} onSend={onSendChat} onPreviewCall={onPreviewChatCall} onPreviewPrompt={onPreviewChatPrompt} />
+      <DirectChatPanel key={`${role}-${agent.id}-${chatState.activeThreadId || "none"}`} role={role} state={chatState} busy={chatBusy} disabled={chatDisabled} newChatDisabled={chatNewDisabled} error={chatError} onNew={onNewChat} onSelect={onSelectChat} onDelete={onDeleteChat} onSend={onSendChat} onPreviewCall={onPreviewChatCall} onPreviewPrompt={onPreviewChatPrompt} />
     </section>
   );
 }
@@ -1157,17 +1354,28 @@ export default function DemoApp() {
 
   const renderedWorkspacePatch = currentWorkspacePatch();
   latestWorkspacePatchRef.current = renderedWorkspacePatch;
-  latestWorkspaceSerializedRef.current = Object.fromEntries(Object.entries(renderedWorkspacePatch).map(([key, value]) => [key, JSON.stringify(value)]));
+  const serverShapedLatest = serverShapedSerialized(renderedWorkspacePatch, serverSnapshotRef.current.config);
+  latestWorkspaceSerializedRef.current = {
+    ...Object.fromEntries(Object.entries(renderedWorkspacePatch).map(([key, value]) => [key, JSON.stringify(value)])),
+    ...serverShapedLatest,
+  };
   const workspacePersisted = saveStatus === "saved"
-    && WORKSPACE_PATCH_KEYS.every((key) => latestWorkspaceSerializedRef.current[key] === serverSnapshotRef.current[key]);
+    && SERVER_PATCH_KEYS.every((key) => latestWorkspaceSerializedRef.current[key] === serverSnapshotRef.current[key]);
 
   const persistWorkspacePatch = useCallback(async function savePatch(patch: WorkspaceStatePatch, serialized: Record<string, string>, allowRebase = true): Promise<boolean> {
-    const sentKeys = Object.keys(patch) as Array<keyof WorkspaceStatePatch>;
+    const outbound: WorkspaceStatePatch = {};
+    if (patch.config !== undefined) outbound.config = configForServerPersist(patch.config, serverSnapshotRef.current.config);
+    if (patch.profiles !== undefined) outbound.profiles = stripProfilesSessionData(patch.profiles);
+    if (patch.versions !== undefined) outbound.versions = patch.versions;
+    if (patch.activeVersion !== undefined) outbound.activeVersion = patch.activeVersion;
+    const sentKeys = Object.keys(outbound) as ServerPatchKey[];
+    if (!sentKeys.length) return true;
+    const shapedSerialized = serverShapedSerialized(outbound, serverSnapshotRef.current.config);
     const baseSnapshot = { ...serverSnapshotRef.current };
     const response = await fetch("/api/state", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...patch, expectedUpdatedAt: serverRevisionRef.current }),
+      body: JSON.stringify({ ...outbound, expectedUpdatedAt: serverRevisionRef.current }),
     });
     const data = await response.json().catch(() => ({}));
     if (response.status === 401) {
@@ -1176,35 +1384,53 @@ export default function DemoApp() {
     }
     if (response.status === 409 && data.state) {
       const current = data.state as WorkspaceState;
-      const currentSnapshot = serializedWorkspaceState(current);
+      const currentSnapshot = serializedServerWorkspaceState(current);
       const conflictingKeys = sentKeys.filter((key) => currentSnapshot[key] !== baseSnapshot[key]);
       if (!conflictingKeys.length && allowRebase) {
         const latestLocalSnapshot = latestWorkspaceSerializedRef.current;
-        const safeServerKeys = WORKSPACE_PATCH_KEYS.filter((key) => !sentKeys.includes(key) && latestLocalSnapshot[key] === baseSnapshot[key]);
+        const safeServerKeys = SERVER_PATCH_KEYS.filter((key) => !sentKeys.includes(key) && latestLocalSnapshot[key] === baseSnapshot[key]);
         const safe = new Set<string>(safeServerKeys);
         serverSnapshotRef.current = currentSnapshot;
         serverRevisionRef.current = current.updatedAt;
-        function adoptServerSlice<K extends keyof WorkspaceStatePatch>(key: K, value: WorkspaceStatePatch[K]) {
+        function adoptServerSlice<K extends ServerPatchKey>(key: K, value: WorkspaceStatePatch[K]) {
           latestWorkspacePatchRef.current = { ...latestWorkspacePatchRef.current, [key]: value };
-          latestWorkspaceSerializedRef.current = { ...latestWorkspaceSerializedRef.current, [key]: JSON.stringify(value) };
+          latestWorkspaceSerializedRef.current = {
+            ...latestWorkspaceSerializedRef.current,
+            ...serverShapedSerialized({ [key]: value } as WorkspaceStatePatch, serverSnapshotRef.current.config),
+          };
         }
         // Only adopt a server slice if it has not changed locally since this
         // request began. New local edits stay dirty and are saved afterwards.
-        if (safe.has("config")) { const value = migrateConfig(current.config); adoptServerSlice("config", value); setConfig(value); }
-        if (safe.has("profiles")) { const value = clone(current.profiles); adoptServerSlice("profiles", value); setProfiles(value); }
-        if (safe.has("versions")) { adoptServerSlice("versions", current.versions); setVersions(current.versions); }
-        if (safe.has("records")) { const value = current.records.slice(0, 20); adoptServerSlice("records", value); setRecords(value); }
-        if (safe.has("directChats")) { const value = clone(current.directChats); adoptServerSlice("directChats", value); setDirectChats(value); }
-        if (safe.has("memories")) {
-          const value = clone(current.memories);
-          adoptServerSlice("memories", value);
-          setInvestorMemory(clone(value.investor ?? null));
-          setFounderMemory(clone(value.founder ?? null));
+        if (safe.has("config")) {
+          const localIds = {
+            investor: latestWorkspacePatchRef.current.config?.investor.id || null,
+            founder: latestWorkspacePatchRef.current.config?.founder.id || null,
+          };
+          const profilesForApply = latestWorkspacePatchRef.current.profiles || deepCloneUserProfiles();
+          const value = applyActiveProfileSelection(migrateConfig(current.config), profilesForApply, localIds);
+          adoptServerSlice("config", value);
+          setConfig(value);
         }
-        if (safe.has("dailyReports")) { const value = clone(current.dailyReports); adoptServerSlice("dailyReports", value); setDailyReports(value); }
+        if (safe.has("profiles")) {
+          const value = applyProfileSessions(
+            clone(current.profiles),
+            extractProfileSessions(latestWorkspacePatchRef.current.profiles || deepCloneUserProfiles()),
+          );
+          const localIds = {
+            investor: latestWorkspacePatchRef.current.config?.investor.id || null,
+            founder: latestWorkspacePatchRef.current.config?.founder.id || null,
+          };
+          adoptServerSlice("profiles", value);
+          setProfiles(value);
+          if (latestWorkspacePatchRef.current.config) {
+            const nextConfig = applyActiveProfileSelection(latestWorkspacePatchRef.current.config, value, localIds);
+            latestWorkspacePatchRef.current = { ...latestWorkspacePatchRef.current, config: nextConfig };
+            setConfig(nextConfig);
+          }
+        }
+        if (safe.has("versions")) { adoptServerSlice("versions", current.versions); setVersions(current.versions); }
         if (safe.has("activeVersion")) { adoptServerSlice("activeVersion", current.activeVersion); setActiveVersion(current.activeVersion); }
-        if (safe.has("activeRecordId")) { adoptServerSlice("activeRecordId", current.activeRecordId); setActiveRecordId(current.activeRecordId); }
-        return savePatch(patch, serialized, false);
+        return savePatch(outbound, shapedSerialized, false);
       }
       const conflicts = conflictingKeys.length ? conflictingKeys.map(String) : sentKeys.map(String);
       const message = `服务器工作区冲突：另一个页面也修改了 ${conflicts.join("、")}。`;
@@ -1214,10 +1440,10 @@ export default function DemoApp() {
       return false;
     }
     if (!response.ok) throw new Error(data.error || "保存服务端工作区失败");
-    sentKeys.forEach((key) => { serverSnapshotRef.current[key] = serialized[key]; });
+    sentKeys.forEach((key) => { serverSnapshotRef.current[key] = shapedSerialized[key]; });
     serverRevisionRef.current = typeof data.updatedAt === "string" ? data.updatedAt : serverRevisionRef.current;
     setSaveConflict([]);
-    const stillDirty = WORKSPACE_PATCH_KEYS.some((key) => latestWorkspaceSerializedRef.current[key] !== serverSnapshotRef.current[key]);
+    const stillDirty = SERVER_PATCH_KEYS.some((key) => latestWorkspaceSerializedRef.current[key] !== serverSnapshotRef.current[key]);
     setSaveStatus(stillDirty ? "saving" : "saved");
     setErrors((currentErrors) => currentErrors.filter((message) => !message.startsWith("服务端自动保存失败：") && !message.startsWith("服务器工作区冲突：")));
     return true;
@@ -1244,6 +1470,7 @@ export default function DemoApp() {
       if (!response.ok) throw new Error(data.error || "读取服务端工作区失败");
       let state = data.state as WorkspaceState;
       const migrationWarnings: string[] = [];
+      let pendingLocalSession: LocalSessionState | null = null;
 
       if (!state.updatedAt) {
         const legacyConfigRaw = localStorage.getItem(LEGACY_CONFIG_KEY);
@@ -1283,15 +1510,12 @@ export default function DemoApp() {
             founder: latest?.results.founderMemory ?? null,
           };
           const migrationReports = latest?.results.dailyReports ?? { investor: null, founder: null };
+          const migrationProfiles = migrateLegacyProfiles(state.profiles || deepCloneUserProfiles(), migrationConfig, migrationMemories, migrationReports);
           const patch: WorkspaceStatePatch = {
             config: migrationConfig,
-            profiles: migrateLegacyProfiles(state.profiles || deepCloneUserProfiles(), migrationConfig, migrationMemories, migrationReports),
+            profiles: stripProfilesSessionData(migrationProfiles),
             versions: legacyVersions || [],
-            records: migratedRecords,
-            memories: migrationMemories,
-            dailyReports: migrationReports,
             activeVersion: latest?.configVersion ?? null,
-            activeRecordId: latest?.conversationId ?? null,
           };
           const migrationResponse = await fetch("/api/state", {
             method: "PUT",
@@ -1301,22 +1525,27 @@ export default function DemoApp() {
           const migrationData = await migrationResponse.json().catch(() => ({}));
           if (!migrationResponse.ok) throw new Error(migrationData.error || "迁移浏览器旧数据失败");
           state = { ...state, ...patch, updatedAt: migrationData.updatedAt || new Date().toISOString() } as WorkspaceState;
+          pendingLocalSession = localSessionFromWorkspace(
+            migratedRecords,
+            migrationMemories,
+            migrationReports,
+            emptyDirectChats(),
+            latest?.conversationId ?? null,
+            migrationProfiles,
+            { investor: migrationConfig.investor.id, founder: migrationConfig.founder.id },
+          );
         }
       }
 
       if (cancelled) return;
       let normalizedConfig = migrateConfig(state.config);
       const normalizedVersions = normalizeLegacyVersions(state.versions);
-      const normalizedRecords = normalizeLegacyRecords(state.records);
       const serverVersions = normalizedVersions.items;
-      const serverRecords = normalizedRecords.items;
       if (normalizedVersions.discarded) migrationWarnings.push(`服务器工作区中有 ${normalizedVersions.discarded} 条无效配置版本，已自动清理。`);
-      if (normalizedRecords.discarded) migrationWarnings.push(`服务器工作区中有 ${normalizedRecords.discarded} 条无效模拟记录，已自动清理。`);
-      const activeRecord = serverRecords.find((record) => record.conversationId === state.activeRecordId) || null;
       const validActiveVersion = serverVersions.some((version) => version.id === state.activeVersion) ? state.activeVersion : null;
-      const memories = state.memories || { investor: null, founder: null };
-      const reports = state.dailyReports || { investor: null, founder: null };
-      const normalizedProfiles = syncProfilesWithConfig(state.profiles || deepCloneUserProfiles(), normalizedConfig, memories, reports);
+      const emptyMemories = { investor: null, founder: null } as Record<AgentRole, unknown | null>;
+      const emptyReports = { investor: null, founder: null } as Record<AgentRole, unknown | null>;
+      let normalizedProfiles = syncProfilesWithConfig(state.profiles || deepCloneUserProfiles(), normalizedConfig, emptyMemories, emptyReports);
       normalizedConfig = clone(normalizedConfig);
       (["investor", "founder"] as AgentRole[]).forEach((role) => {
         const profile = activeUserProfile(normalizedProfiles, normalizedConfig, role);
@@ -1327,9 +1556,71 @@ export default function DemoApp() {
           prompts: { ...normalizedConfig[role].prompts, dynamic: clone(profile.dynamicLayer) },
         };
       });
-      const activeInvestorProfile = activeUserProfile(normalizedProfiles, normalizedConfig, "investor");
-      const activeFounderProfile = activeUserProfile(normalizedProfiles, normalizedConfig, "founder");
-      const loadedDirectChats = clone(state.directChats || emptyDirectChats());
+
+      const existingLocal = readLocalSession();
+      const serverRecords = normalizeLegacyRecords(state.records || []).items;
+      const serverDirectChats = clone(state.directChats || emptyDirectChats());
+      const serverMemories = state.memories || emptyMemories;
+      const serverReports = state.dailyReports || emptyReports;
+      const serverHasSessionResidue = serverRecords.length > 0
+        || serverDirectChats.investor.threads.length > 0
+        || serverDirectChats.founder.threads.length > 0
+        || serverMemories.investor != null
+        || serverMemories.founder != null
+        || serverReports.investor != null
+        || serverReports.founder != null
+        || state.activeRecordId != null
+        || (state.profiles?.investor || []).some((profile) => profile.memory != null || profile.dailyReport != null)
+        || (state.profiles?.founder || []).some((profile) => profile.memory != null || profile.dailyReport != null);
+
+      let localSession = pendingLocalSession || existingLocal;
+      if ((!localSession || isLocalSessionEmpty(localSession)) && serverHasSessionResidue) {
+        const migratedProfiles = applyProfileSessions(
+          normalizedProfiles,
+          {
+            investor: (state.profiles?.investor || []).map((profile) => ({ id: profile.id, memory: clone(profile.memory), dailyReport: clone(profile.dailyReport) })),
+            founder: (state.profiles?.founder || []).map((profile) => ({ id: profile.id, memory: clone(profile.memory), dailyReport: clone(profile.dailyReport) })),
+          },
+        );
+        localSession = localSessionFromWorkspace(
+          serverRecords,
+          {
+            investor: serverMemories.investor ?? activeUserProfile(migratedProfiles, normalizedConfig, "investor").memory,
+            founder: serverMemories.founder ?? activeUserProfile(migratedProfiles, normalizedConfig, "founder").memory,
+          },
+          {
+            investor: serverReports.investor ?? activeUserProfile(migratedProfiles, normalizedConfig, "investor").dailyReport,
+            founder: serverReports.founder ?? activeUserProfile(migratedProfiles, normalizedConfig, "founder").dailyReport,
+          },
+          serverDirectChats,
+          state.activeRecordId,
+          migratedProfiles,
+          { investor: normalizedConfig.investor.id, founder: normalizedConfig.founder.id },
+        );
+        migrationWarnings.push("已将服务端旧的模拟记录/记忆/日报/直接对话迁移到本浏览器。");
+      }
+      if (!localSession) localSession = emptyLocalSession();
+      if (!localSession.activeProfileIds.investor && !localSession.activeProfileIds.founder) {
+        localSession = {
+          ...localSession,
+          activeProfileIds: { investor: normalizedConfig.investor.id, founder: normalizedConfig.founder.id },
+        };
+      }
+      writeLocalSession(localSession);
+
+      normalizedProfiles = applyProfileSessions(normalizedProfiles, localSession.profileSessions);
+      normalizedConfig = applyActiveProfileSelection(normalizedConfig, normalizedProfiles, localSession.activeProfileIds);
+      (["investor", "founder"] as AgentRole[]).forEach((role) => {
+        const index = normalizedProfiles[role].findIndex((profile) => profile.id === normalizedConfig[role].id);
+        if (index < 0) return;
+        normalizedProfiles[role][index] = {
+          ...normalizedProfiles[role][index],
+          memory: clone(localSession!.memories[role]),
+          dailyReport: clone(localSession!.dailyReports[role]),
+        };
+      });
+
+      const loadedDirectChats = clone(localSession.directChats);
       (["investor", "founder"] as AgentRole[]).forEach((role) => {
         const currentId = loadedDirectChats[role].activeThreadId;
         const currentThread = loadedDirectChats[role].threads.find((thread) => thread.id === currentId);
@@ -1338,16 +1629,51 @@ export default function DemoApp() {
         }
       });
 
+      const activeInvestorProfile = activeUserProfile(normalizedProfiles, normalizedConfig, "investor");
+      const activeFounderProfile = activeUserProfile(normalizedProfiles, normalizedConfig, "founder");
+      const appliedMemories = {
+        investor: clone(localSession.memories.investor ?? activeInvestorProfile.memory),
+        founder: clone(localSession.memories.founder ?? activeFounderProfile.memory),
+      };
+      const appliedDailyReports = {
+        investor: clone(localSession.dailyReports.investor ?? activeInvestorProfile.dailyReport),
+        founder: clone(localSession.dailyReports.founder ?? activeFounderProfile.dailyReport),
+      };
+      const localRecords = localSession.records.slice(0, 20);
+      const activeRecord = localRecords.find((record) => record.conversationId === localSession!.activeRecordId) || null;
+      const appliedActiveRecordId = activeRecord?.conversationId || null;
+
+      const appliedWorkspace: WorkspaceStatePatch = {
+        config: normalizedConfig,
+        profiles: normalizedProfiles,
+        versions: serverVersions,
+        records: localRecords,
+        directChats: loadedDirectChats,
+        memories: appliedMemories,
+        dailyReports: appliedDailyReports,
+        activeVersion: validActiveVersion,
+        activeRecordId: appliedActiveRecordId,
+      };
+      const appliedServerSerialized = serverShapedSerialized(appliedWorkspace, JSON.stringify(state.config));
+      const serverSerialized = serializedServerWorkspaceState({
+        ...state,
+        config: state.config,
+        profiles: state.profiles || deepCloneUserProfiles(),
+        versions: state.versions,
+        activeVersion: state.activeVersion,
+      });
+      const needsNormalizePersist = SERVER_PATCH_KEYS.some((key) => appliedServerSerialized[key] !== serverSerialized[key]) || serverHasSessionResidue;
+
       setConfig(normalizedConfig);
       setProfiles(normalizedProfiles);
       setVersions(serverVersions);
-      setRecords(serverRecords);
+      setRecords(localRecords);
       setDirectChats(loadedDirectChats);
       setActiveVersion(validActiveVersion);
-      setActiveRecordId(activeRecord?.conversationId || null);
-      setInvestorMemory(clone(activeInvestorProfile.memory));
-      setFounderMemory(clone(activeFounderProfile.memory));
-      setDailyReports({ investor: clone(activeInvestorProfile.dailyReport), founder: clone(activeFounderProfile.dailyReport) });
+      setActiveRecordId(appliedActiveRecordId);
+      setInvestorMemory(appliedMemories.investor);
+      setFounderMemory(appliedMemories.founder);
+      setDailyReports(appliedDailyReports);
       setMessages(activeRecord ? clone(activeRecord.messages) : []);
       setDebugCalls(activeRecord ? clone(activeRecord.debugCalls) : []);
       setPublicResult(activeRecord ? clone(activeRecord.results.public ?? null) : null);
@@ -1359,22 +1685,19 @@ export default function DemoApp() {
         lastRunFilesRef.current = clone(activeRecord.fileSnapshots);
         lastRunMemoriesRef.current = clone(activeRecord.memorySnapshots);
       }
-      serverSnapshotRef.current = {
-        config: JSON.stringify(state.config),
-        profiles: JSON.stringify(state.profiles || deepCloneUserProfiles()),
-        versions: JSON.stringify(state.versions),
-        records: JSON.stringify(state.records),
-        directChats: JSON.stringify(state.directChats || emptyDirectChats()),
-        memories: JSON.stringify(memories),
-        dailyReports: JSON.stringify(reports),
-        activeVersion: JSON.stringify(state.activeVersion),
-        activeRecordId: JSON.stringify(state.activeRecordId),
-      };
+      // Keep serverSnapshot on the raw wire form when normalize changed data, so
+      // auto-save can push the applied state; UI still treats local as ready.
+      serverSnapshotRef.current = needsNormalizePersist ? serverSerialized : appliedServerSerialized;
       serverRevisionRef.current = state.updatedAt;
+      latestWorkspacePatchRef.current = appliedWorkspace;
+      latestWorkspaceSerializedRef.current = {
+        ...Object.fromEntries(Object.entries(appliedWorkspace).map(([key, value]) => [key, JSON.stringify(value)])),
+        ...appliedServerSerialized,
+      };
       setSaveConflict([]);
       LEGACY_STORAGE_KEYS.forEach((key) => localStorage.removeItem(key));
       setWorkspaceReady(true);
-      setSaveStatus("saved");
+      setSaveStatus(needsNormalizePersist ? "saving" : "saved");
     }
 
     loadWorkspace().catch((caught) => {
@@ -1389,18 +1712,18 @@ export default function DemoApp() {
     if (!workspaceReady || auth !== "signed-in" || saveConflict.length || logoutInProgressRef.current) return;
     const fullPatch = currentWorkspacePatch();
     const fullPatchRecord = fullPatch as Record<keyof WorkspaceStatePatch, WorkspaceStatePatch[keyof WorkspaceStatePatch]>;
-    const serialized = Object.fromEntries(Object.entries(fullPatch).map(([key, value]) => [key, JSON.stringify(value)]));
-    const changedKeys = Object.keys(serialized).filter((key) => serverSnapshotRef.current[key] !== serialized[key]) as Array<keyof WorkspaceStatePatch>;
+    const shapedSerialized = serverShapedSerialized(fullPatch, serverSnapshotRef.current.config);
+    const changedKeys = SERVER_PATCH_KEYS.filter((key) => serverSnapshotRef.current[key] !== shapedSerialized[key]);
     if (!changedKeys.length) { setSaveStatus("saved"); return; }
     if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
     setSaveStatus("saving");
     saveTimerRef.current = setTimeout(() => {
       saveTimerRef.current = null;
       saveQueueRef.current = saveQueueRef.current.then(async () => {
-        const pendingKeys = changedKeys.filter((key) => serverSnapshotRef.current[key] !== serialized[key]);
+        const pendingKeys = changedKeys.filter((key) => serverSnapshotRef.current[key] !== shapedSerialized[key]);
         if (!pendingKeys.length) { setSaveStatus("saved"); return; }
         const patch = Object.fromEntries(pendingKeys.map((key) => [key, fullPatchRecord[key]])) as WorkspaceStatePatch;
-        const patchSerialized = Object.fromEntries(pendingKeys.map((key) => [key, serialized[key]]));
+        const patchSerialized = Object.fromEntries(pendingKeys.map((key) => [key, shapedSerialized[key]]));
         await persistWorkspacePatch(patch, patchSerialized);
       }).catch((caught) => {
         const message = `服务端自动保存失败：${caught instanceof Error ? caught.message : String(caught)}`;
@@ -1414,8 +1737,22 @@ export default function DemoApp() {
   }, [auth, currentWorkspacePatch, logoutBusy, persistWorkspacePatch, saveConflict, workspaceReady, workspaceSaveRetry]);
 
   useEffect(() => {
+    if (!workspaceReady || auth !== "signed-in") return;
+    const session = localSessionFromWorkspace(
+      records,
+      { investor: investorMemory, founder: founderMemory },
+      dailyReports,
+      directChats,
+      activeRecordId,
+      profiles,
+      { investor: config.investor.id, founder: config.founder.id },
+    );
+    writeLocalSession(session);
+  }, [auth, workspaceReady, records, investorMemory, founderMemory, dailyReports, directChats, activeRecordId, profiles, config.investor.id, config.founder.id]);
+
+  useEffect(() => {
     function protectUnsavedChanges(event: BeforeUnloadEvent) {
-      const hasUnsavedChanges = WORKSPACE_PATCH_KEYS.some((key) => latestWorkspaceSerializedRef.current[key] !== serverSnapshotRef.current[key]);
+      const hasUnsavedChanges = SERVER_PATCH_KEYS.some((key) => latestWorkspaceSerializedRef.current[key] !== serverSnapshotRef.current[key]);
       const hasProfileDraft = Object.values(profileDirtyRef.current).some(Boolean);
       if (!hasUnsavedChanges && !hasProfileDraft && !saveTimerRef.current) return;
       event.preventDefault();
@@ -1531,8 +1868,7 @@ export default function DemoApp() {
       return { ...current, [role]: { ...current[role], activeThreadId: latest?.id || null } };
     });
     setDirectChatErrors((current) => ({ ...current, [role]: "" }));
-    setActiveVersion(null);
-    setToast(`已切换到${ROLE_LABEL[role]}资料“${profile.name}”`);
+    setToast(`已切换到${ROLE_LABEL[role]}资料“${profile.name}”（仅本机，不影响其他人）`);
   }
 
   function createUserProfile(role: AgentRole) {
@@ -1543,7 +1879,7 @@ export default function DemoApp() {
     if (!name) return;
     if (name.length > 80) { setToast("资料名称不能超过 80 个字符"); return; }
     if (profiles[role].some((profile) => profile.name.toLocaleLowerCase() === name.toLocaleLowerCase())) { setToast("已有同名资料，请换一个名称"); return; }
-    const profileId = `${role}-custom-${crypto.randomUUID()}`;
+    const profileId = `${role}-custom-${createBrowserId()}`;
     const fields = Object.fromEntries(FIELD_DEFINITIONS[role].map((field) => [field.key, field.key === "agentName" ? name : ""]));
     const agent: AgentProfile = {
       ...config[role],
@@ -1559,8 +1895,7 @@ export default function DemoApp() {
     else setFounderMemory(null);
     setDailyReports((current) => ({ ...current, [role]: null }));
     setDirectChats((current) => ({ ...current, [role]: { ...current[role], activeThreadId: null } }));
-    setActiveVersion(null);
-    setToast(`已创建空白${ROLE_LABEL[role]}资料；动态层、文件、记忆、日报和对话均为空`);
+    setToast(`已创建空白${ROLE_LABEL[role]}资料；选用仅本机生效，资料条目仍会同步到共享资料库`);
   }
 
   function handleAgentFilesChange(role: AgentRole, files: AgentFileRecord[], uploadedIds: string[] = []) {
@@ -1606,7 +1941,7 @@ export default function DemoApp() {
         setToast(`${ROLE_LABEL[role]}资料已达 20 套，无法${sourceLabel}`);
         return false;
       }
-      agent.id = `${role}-custom-${crypto.randomUUID()}`;
+      agent.id = `${role}-custom-${createBrowserId()}`;
       const profile = userProfileFromAgent(agent, `${sourceLabel} · ${agent.fields.agentName || ROLE_LABEL[role]}`, "custom");
       nextProfiles[role] = [profile, ...nextProfiles[role]];
       selected[role] = profile;
@@ -1751,7 +2086,7 @@ export default function DemoApp() {
     try { return extractJson(raw); } catch (firstError) {
       const systemPrompt = snapshot.jsonRepairPrompt;
       const repairMessages = [{ role: "system" as const, content: systemPrompt }, { role: "user" as const, content: `目标：${context}\n\n待修复内容：\n${raw}` }];
-      const repaired = await modelCall({ record, type: "json_repair", actor: "system", round: null, systemPrompt, messages: repairMessages, maxTokens: snapshot.settings.maxTokens, snapshot, recordProgress, publishDebug });
+      const repaired = await modelCall({ record, type: "json_repair", actor: "system", round: null, systemPrompt, messages: repairMessages, maxTokens: Math.max(2048, snapshot.settings.maxTokens), snapshot, recordProgress, publishDebug });
       try { return extractJson(repaired.raw); } catch (secondError) {
         const message = `首次解析：${firstError instanceof Error ? firstError.message : String(firstError)}；修复后解析：${secondError instanceof Error ? secondError.message : String(secondError)}`;
         throw Object.assign(new Error(message), { raw: repaired.raw || raw });
@@ -1784,7 +2119,7 @@ export default function DemoApp() {
           layerStates: isPublic ? {} : Object.fromEntries(Object.entries(snapshot[role].prompts).map(([key, layer]) => [key, key === "task" || key === "user" ? true : layer.enabled])),
           profile: isPublic ? null : snapshot[role].fields,
           messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
-          maxTokens: Math.max(1200, snapshot.settings.maxTokens), snapshot,
+          maxTokens: Math.max(4096, snapshot.settings.maxTokens), snapshot,
           agentRole: isPublic ? undefined : role,
           fileIds: isPublic ? undefined : record.fileSnapshots[role].filter((file) => file.status === "ready").map((file) => file.id),
           toolsEnabled: !isPublic && snapshot[role].prompts.tools.enabled,
@@ -1972,10 +2307,12 @@ export default function DemoApp() {
   }
 
   function createDirectChat(role: AgentRole) {
-    if (directChatBusy || dailyBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) return;
-    if (!workspacePersisted) { setToast("请等待当前资料保存到服务器后再创建对话"); return; }
-    if (profileDirtyRef.current[role]) {
-      setToast(`请先保存${ROLE_LABEL[role]}资料，再创建与自己 Agent 的测试对话`);
+    if (directChatBusy || dailyBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) {
+      setToast("模拟或模型任务进行中，请稍后再创建新对话");
+      return;
+    }
+    if (saveStatus === "error") {
+      setToast(saveConflict.length ? "请先处理顶部的服务器工作区冲突" : "工作区保存失败，请先点击顶部“保存失败”重试");
       return;
     }
     const currentRoleState = directChats[role];
@@ -2115,9 +2452,22 @@ export default function DemoApp() {
   }
 
   function start() {
-    if (dailyBusy || directChatBusy || ["running", "paused", "postprocessing"].includes(status)) return;
-    if (!workspacePersisted) { setToast("请等待当前资料保存到服务器后再开始模拟"); return; }
-    if (Object.values(profileDirtyRef.current).some(Boolean)) { setToast("请先保存双方资料，再冻结 Agent Card 并开始模拟"); return; }
+    if (dailyBusy || directChatBusy || ["running", "paused", "postprocessing"].includes(status)) {
+      setToast("请等待当前模型任务结束后再开始模拟");
+      return;
+    }
+    if (saveStatus === "error") {
+      setToast(saveConflict.length ? "请先处理顶部的服务器工作区冲突" : "工作区保存失败，请先点击顶部“保存失败”重试");
+      return;
+    }
+    if (!workspacePersisted) {
+      setToast(saveStatus === "saving" ? "工作区正在保存到服务器，请稍候再开始模拟" : "工作区尚未与服务器同步，请稍候再开始模拟");
+      return;
+    }
+    if (Object.values(profileDirtyRef.current).some(Boolean)) {
+      setToast("请先保存双方资料，再冻结 Agent Card 并开始模拟");
+      return;
+    }
     runSimulation(clone(config), currentProfileFileSnapshots(), { investor: clone(investorMemory), founder: clone(founderMemory) });
   }
 
@@ -2214,13 +2564,13 @@ export default function DemoApp() {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const fullPatch = clone(latestWorkspacePatchRef.current);
         const fullPatchRecord = fullPatch as Record<keyof WorkspaceStatePatch, WorkspaceStatePatch[keyof WorkspaceStatePatch]>;
-        const serialized = Object.fromEntries(Object.entries(fullPatch).map(([key, value]) => [key, JSON.stringify(value)]));
-        const changedKeys = Object.keys(serialized).filter((key) => serverSnapshotRef.current[key] !== serialized[key]) as Array<keyof WorkspaceStatePatch>;
+        const shapedSerialized = serverShapedSerialized(fullPatch, serverSnapshotRef.current.config);
+        const changedKeys = SERVER_PATCH_KEYS.filter((key) => serverSnapshotRef.current[key] !== shapedSerialized[key]);
         if (!changedKeys.length) break;
         const patch = Object.fromEntries(changedKeys.map((key) => [key, fullPatchRecord[key]])) as WorkspaceStatePatch;
-        const patchSerialized = Object.fromEntries(changedKeys.map((key) => [key, serialized[key]]));
+        const patchSerialized = Object.fromEntries(changedKeys.map((key) => [key, shapedSerialized[key]]));
         if (!await persistWorkspacePatch(patch, patchSerialized)) { logoutInProgressRef.current = false; setLogoutBusy(false); return; }
-        if (attempt === 2 && WORKSPACE_PATCH_KEYS.some((key) => latestWorkspaceSerializedRef.current[key] !== serverSnapshotRef.current[key])) {
+        if (attempt === 2 && SERVER_PATCH_KEYS.some((key) => latestWorkspaceSerializedRef.current[key] !== serverSnapshotRef.current[key])) {
           throw new Error("退出前工作区仍在变化，请稍后重试");
         }
       }
@@ -2258,6 +2608,12 @@ export default function DemoApp() {
 
   const busy = ["running", "paused", "stopping", "postprocessing"].includes(status);
   const modelBusy = busy || dailyBusy !== null || directChatBusy !== null;
+  const startBlockedReason = !workspacePersisted
+    ? (saveStatus === "saving" ? "工作区正在保存到服务器，请稍候" : saveStatus === "error" ? "工作区保存失败，请先点击顶部“保存失败”重试" : "工作区尚未与服务器同步")
+    : Object.values(profileDirty).some(Boolean) ? "请先保存双方资料并更新 Agent Card"
+      : dailyBusy !== null ? `${ROLE_LABEL[dailyBusy]}日报生成中`
+        : directChatBusy !== null ? `${ROLE_LABEL[directChatBusy]}用户测试对话进行中`
+          : null;
   const statusLabel: Record<RunStatus, string> = { idle: "未运行", running: "运行中", paused: "已暂停", stopping: "正在停止", postprocessing: "结果生成中", completed: "已完成", error: "运行失败" };
   const actualEvaluatorCall = [...debugCalls].reverse().find((call) => call.type === "public_evaluation");
   const actualJsonRepairCall = [...debugCalls].reverse().find((call) => call.type === "json_repair");
@@ -2291,13 +2647,14 @@ export default function DemoApp() {
           <aside className="controls">
             <div className="control-title"><strong>本次运行设置</strong><span>编辑仅影响下一次模拟</span></div>
             <div className="run-buttons">
-              {!busy && <button className="primary" disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={start}>▶ 开始模拟</button>}
+              {!busy && <button className="primary" title={startBlockedReason || undefined} aria-disabled={Boolean(startBlockedReason)} onClick={start}>▶ 开始模拟</button>}
               {status === "running" && <button onClick={() => { pauseRef.current = true; setStatus("paused"); }}>Ⅱ 暂停</button>}
               {status === "paused" && <button className="primary" onClick={() => { pauseRef.current = false; setStatus("running"); }}>▶ 继续</button>}
               {busy && <button className="danger" onClick={stop}>■ 停止</button>}
               {!busy && messages.length > 0 && <button disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={rerunLastSnapshot}>↻ 按原快照重新生成</button>}
               <button disabled={dailyBusy !== null || directChatBusy !== null || (busy && status !== "paused")} onClick={reset}>重置</button>
             </div>
+            {startBlockedReason && <div className="run-block-reason">{startBlockedReason}</div>}
             <div className="run-settings-note">对话规则会写入任务层传给双方 Agent；“结果 / 记忆”开关由平台在对话后调度执行。</div>
             <div className="control-grid">
               <label>最大对话轮数<input type="number" min={1} max={20} value={config.settings.maxRounds} disabled={busy} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, maxRounds: Number(event.target.value) } })} /></label>
@@ -2400,6 +2757,8 @@ export default function DemoApp() {
             activeThreadId: profileThreads.some((thread) => thread.id === directChats[role].activeThreadId) ? directChats[role].activeThreadId : profileThreads[0]?.id || null,
             threads: profileThreads,
           };
+          const chatNewDisabled = busy || dailyBusy !== null || directChatBusy === role;
+          const chatComposerDisabled = !workspacePersisted || busy || dailyBusy !== null || directChatBusy === role;
           return <AgentPanel
           key={`${role}-${config[role].id}-${profileFieldsKey(config[role].fields)}`}
           role={role}
@@ -2413,7 +2772,8 @@ export default function DemoApp() {
           promptPreview={() => setPromptModal({ title: `${ROLE_LABEL[role]} Agent · 当前最终组合提示词`, content: composePrompt(config[role], config.settings) })}
           chatState={profileChatState}
           chatBusy={directChatBusy === role}
-          chatDisabled={!workspacePersisted || busy || dailyBusy !== null || (directChatBusy !== null && directChatBusy !== role)}
+          chatDisabled={chatComposerDisabled}
+          chatNewDisabled={chatNewDisabled}
           chatError={directChatErrors[role]}
           onNewChat={() => createDirectChat(role)}
           onSelectChat={(threadId) => selectDirectChat(role, threadId)}
@@ -2434,7 +2794,7 @@ export default function DemoApp() {
 
       {versionOpen && <div className="modal-backdrop" onMouseDown={() => setVersionOpen(false)}><section className="modal list-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>SERVER VERSIONS</p><h2>配置版本</h2></div><button onClick={() => setVersionOpen(false)}>×</button></div><button className="primary" onClick={saveVersion}>＋ 保存当前配置</button><div className="saved-list">{versions.length ? versions.map((version) => <article key={version.id}><div><strong>{version.name}</strong><span>{new Date(version.createdAt).toLocaleString("zh-CN")}</span></div><div><button onClick={() => loadVersion(version)}>加载</button><button onClick={() => downloadJson(`${version.name}.json`, version.config)}>导出</button><button className="danger-text" onClick={() => setVersions((current) => current.filter((item) => item.id !== version.id))}>删除</button></div></article>) : <div className="empty-panel">还没有保存版本</div>}</div></section></div>}
 
-      {recordsOpen && <div className="modal-backdrop" onMouseDown={() => setRecordsOpen(false)}><section className="modal records-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>SERVER RUN HISTORY</p><h2>最近模拟记录</h2></div><button onClick={() => setRecordsOpen(false)}>×</button></div><div className="saved-list">{records.length ? records.map((record) => <article key={record.conversationId}><div><strong>{record.configSnapshot.investor.fields.agentName} × {record.configSnapshot.founder.fields.agentName}</strong><span>{new Date(record.createdAt).toLocaleString("zh-CN")} · {record.messages.length} 条消息 · {record.endReason}</span><code>{record.conversationId}</code></div><div><button onClick={() => loadRecord(record)}>查看</button><button onClick={() => downloadJson(`${record.conversationId}.json`, record)}>导出</button></div></article>) : <div className="empty-panel">还没有模拟记录</div>}</div></section></div>}
+      {recordsOpen && <div className="modal-backdrop" onMouseDown={() => setRecordsOpen(false)}><section className="modal records-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>LOCAL RUN HISTORY</p><h2>最近模拟记录</h2></div><button onClick={() => setRecordsOpen(false)}>×</button></div><div className="saved-list">{records.length ? records.map((record) => <article key={record.conversationId}><div><strong>{record.configSnapshot.investor.fields.agentName} × {record.configSnapshot.founder.fields.agentName}</strong><span>{new Date(record.createdAt).toLocaleString("zh-CN")} · {record.messages.length} 条消息 · {record.endReason}</span><code>{record.conversationId}</code></div><div><button onClick={() => loadRecord(record)}>查看</button><button onClick={() => downloadJson(`${record.conversationId}.json`, record)}>导出</button></div></article>) : <div className="empty-panel">还没有模拟记录</div>}</div></section></div>}
 
       {debugDrawer && <><div className="drawer-backdrop" onClick={() => setDebugDrawer(false)} /><aside className="debug-drawer"><div className="modal-head"><div><p>MODEL CALL INSPECTOR</p><h2>调试抽屉</h2></div><button onClick={() => setDebugDrawer(false)}>×</button></div><DebugList calls={allDebugCalls} /></aside></>}
       {toast && <div className="toast">{toast}</div>}

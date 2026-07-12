@@ -50,12 +50,15 @@ export function rateLimitKey(request: Request, username: string): string {
 export function isSameOrigin(request: Request): boolean {
   const origin = request.headers.get("origin");
   if (!origin) return false;
-  if (process.env.APP_ORIGIN) return origin === process.env.APP_ORIGIN.replace(/\/$/, "");
+  const configured = process.env.APP_ORIGIN?.replace(/\/$/, "");
+  if (configured && origin === configured) return true;
   if (process.env.TRUST_PROXY === "1") {
     const host = request.headers.get("x-forwarded-host") || request.headers.get("host");
     const protocol = request.headers.get("x-forwarded-proto") || "https";
     return Boolean(host && origin === `${protocol}://${host}`);
   }
+  const host = request.headers.get("host");
+  if (host) return origin === `${new URL(request.url).protocol}//${host}`;
   return origin === new URL(request.url).origin;
 }
 
@@ -92,7 +95,9 @@ export async function isAuthenticated(request: Request): Promise<boolean> {
 }
 
 export function sessionCookie(token: string): string {
-  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  const origin = process.env.APP_ORIGIN || "";
+  const useSecure = process.env.NODE_ENV === "production" && origin.startsWith("https://");
+  const secure = useSecure ? "; Secure" : "";
   return `vc_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800${secure}`;
 }
 

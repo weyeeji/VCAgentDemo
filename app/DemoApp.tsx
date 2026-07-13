@@ -643,6 +643,26 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 }
 
+/** Normalize common model aliases into the required turn `message` field. */
+function coerceTurnReply(value: unknown): Record<string, unknown> {
+  const record = asRecord(value);
+  if (typeof record.message === "string" && record.message.trim()) return record;
+  const aliases = ["Message", "content", "Content", "reply", "Reply", "text", "Text", "response", "回答", "回复", "msg"];
+  for (const key of aliases) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate.trim()) return { ...record, message: candidate };
+  }
+  return record;
+}
+
+function assertTurnReply(value: unknown): Record<string, unknown> {
+  const record = coerceTurnReply(value);
+  if (typeof record.message !== "string" || !record.message.trim()) {
+    throw new Error("结构化输出缺少非空 message 字段");
+  }
+  return record;
+}
+
 function rawFromError(value: unknown): string {
   const record = asRecord(value);
   return typeof record.raw === "string" ? record.raw : "";
@@ -2082,12 +2102,21 @@ export default function DemoApp() {
     }
   }
 
-  async function parseWithRepair(raw: string, context: string, record: SimulationRecord, snapshot: AppConfig, recordProgress: "replace" | "merge-debug" | "none" = "replace", publishDebug = true): Promise<unknown> {
-    try { return extractJson(raw); } catch (firstError) {
+  async function parseWithRepair(
+    raw: string,
+    context: string,
+    record: SimulationRecord,
+    snapshot: AppConfig,
+    recordProgress: "replace" | "merge-debug" | "none" = "replace",
+    publishDebug = true,
+    validate?: (value: unknown) => unknown,
+  ): Promise<unknown> {
+    const accept = (value: unknown): unknown => (validate ? validate(value) : value);
+    try { return accept(extractJson(raw)); } catch (firstError) {
       const systemPrompt = snapshot.jsonRepairPrompt;
       const repairMessages = [{ role: "system" as const, content: systemPrompt }, { role: "user" as const, content: `目标：${context}\n\n待修复内容：\n${raw}` }];
       const repaired = await modelCall({ record, type: "json_repair", actor: "system", round: null, systemPrompt, messages: repairMessages, maxTokens: Math.max(2048, snapshot.settings.maxTokens), snapshot, recordProgress, publishDebug });
-      try { return extractJson(repaired.raw); } catch (secondError) {
+      try { return accept(extractJson(repaired.raw)); } catch (secondError) {
         const message = `首次解析：${firstError instanceof Error ? firstError.message : String(firstError)}；修复后解析：${secondError instanceof Error ? secondError.message : String(secondError)}`;
         throw Object.assign(new Error(message), { raw: repaired.raw || raw });
       }
@@ -2186,8 +2215,8 @@ export default function DemoApp() {
             { role: "user" as const, content: formatPeerAgentCardMessage(record.agentCardSnapshots[otherRole(role)]) },
             ...history,
           ];
-          if (!history.length) apiMessages.push({ role: "user", content: "请根据本次任务与资料开始对话，直接输出约定 JSON。" });
-          else apiMessages.push({ role: "user", content: pendingEndFrom && pendingEndFrom !== role ? "对方建议结束。请给出最后一次有价值的回应，并在适当时确认结束。直接输出约定 JSON。" : "请回应对方最新发言，直接输出约定 JSON。" });
+          if (!history.length) apiMessages.push({ role: "user", content: "请根据本次任务与资料开始对话，直接输出约定 JSON（message 必须为非空字符串）。" });
+          else apiMessages.push({ role: "user", content: pendingEndFrom && pendingEndFrom !== role ? "对方建议结束。请给出最后一次有价值的回应，并在适当时确认结束。直接输出约定 JSON（message 必须为非空字符串）。" : "请回应对方最新发言，直接输出约定 JSON（message 必须为非空字符串）。" });
           const started = Date.now();
           try {
             const response = await modelCall({
@@ -2198,17 +2227,24 @@ export default function DemoApp() {
               fileIds: filesSnapshot[role].filter((file) => file.status === "ready").map((file) => file.id),
               toolsEnabled: agent.prompts.tools.enabled,
             });
-            const parsed = await parseWithRepair(response.raw, `${ROLE_LABEL[role]}第 ${round} 轮对话回复，必须包含 message 和 control`, record, snapshot);
-            const parsedRecord = asRecord(parsed);
-            if (typeof parsedRecord.message !== "string" || !parsedRecord.message.trim()) throw Object.assign(new Error("结构化输出缺少非空 message 字段"), { raw: response.raw });
+            const parsedRecord = await parseWithRepair(
+              response.raw,
+              `${ROLE_LABEL[role]}第 ${round} 轮对话回复，必须包含非空字符串 message 字段，以及 control 对象`,
+              record,
+              snapshot,
+              "replace",
+              true,
+              assertTurnReply,
+            ) as Record<string, unknown>;
             const control = normalizeControl(parsedRecord.control);
             const cost = response.inputTokens / 1_000_000 * snapshot.settings.inputPricePerMillion + response.outputTokens / 1_000_000 * snapshot.settings.outputPricePerMillion;
-            const turn: TurnMessage = { id: id("turn"), role, agentName: agent.fields.agentName || ROLE_LABEL[role], round, content: parsedRecord.message.trim(), control,
+            const turn: TurnMessage = { id: id("turn"), role, agentName: agent.fields.agentName || ROLE_LABEL[role], round, content: String(parsedRecord.message).trim(), control,
               durationMs: Date.now() - started, inputTokens: response.inputTokens, outputTokens: response.outputTokens, usageEstimated: response.usageEstimated, estimatedCost: cost, createdAt: new Date().toISOString() };
             record.messages.push(turn);
             setMessages([...record.messages]);
-            const latestDebug = record.debugCalls[record.debugCalls.length - 1];
-            if (latestDebug) latestDebug.parsedResult = parsed;
+            const latestDebug = [...record.debugCalls].reverse().find((call) => call.type === (role === "investor" ? "investor_turn" : "founder_turn") && call.round === round)
+              || record.debugCalls[record.debugCalls.length - 1];
+            if (latestDebug) latestDebug.parsedResult = parsedRecord;
             setDebugCalls([...record.debugCalls]);
             saveRecordProgress(record);
 
@@ -2422,14 +2458,20 @@ export default function DemoApp() {
         recordProgress: "none",
         publishDebug: false,
       });
-      const result = await parseWithRepair(response.raw, `${ROLE_LABEL[role]}用户测试对话回复，必须包含 message 和 control`, scratch, callSnapshot, "none", false);
-      const resultRecord = asRecord(result);
-      if (typeof resultRecord.message !== "string" || !resultRecord.message.trim()) throw Object.assign(new Error("结构化输出缺少非空 message 字段"), { raw: response.raw });
+      const resultRecord = await parseWithRepair(
+        response.raw,
+        `${ROLE_LABEL[role]}用户测试对话回复，必须包含非空字符串 message 字段，以及 control 对象`,
+        scratch,
+        callSnapshot,
+        "none",
+        false,
+        assertTurnReply,
+      ) as Record<string, unknown>;
       const directCall = scratch.debugCalls.find((call) => call.type === `${role}_direct_chat`);
-      if (directCall) directCall.parsedResult = result;
+      if (directCall) directCall.parsedResult = resultRecord;
       const toolCalls = clone(directCall?.toolCalls || []);
       const assistantMessage: DirectChatMessage = {
-        id: id("direct-agent"), role: "assistant", content: resultRecord.message.trim(), createdAt: new Date().toISOString(),
+        id: id("direct-agent"), role: "assistant", content: String(resultRecord.message).trim(), createdAt: new Date().toISOString(),
         callId: directCall?.id || null, inputTokens: response.inputTokens, outputTokens: response.outputTokens,
         usageEstimated: response.usageEstimated,
         estimatedCost: response.inputTokens / 1_000_000 * thread.settingsSnapshot.inputPricePerMillion + response.outputTokens / 1_000_000 * thread.settingsSnapshot.outputPricePerMillion,

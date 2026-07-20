@@ -9,7 +9,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "node .next/standalone/server.js",
-    "test": "npm run lint && npm run build",
+    "test": "npm run lint && npm run test:unit && npm run build",
+    "test:unit": "tsx --test tests/*.test.ts",
+    "test:memory": "tsx --test tests/memory-store.test.ts",
     "lint": "eslint . --ignore-pattern .next --ignore-pattern dist",
     "generate:pdfs": ".venv-pdf/bin/python scripts/generate_test_pdfs.py || python3 scripts/generate_test_pdfs.py",
     "seed": "tsx scripts/seed-demo-data.ts"

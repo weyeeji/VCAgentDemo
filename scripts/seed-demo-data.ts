@@ -92,7 +92,7 @@ function initDatabase(database: DatabaseSync): void {
 async function importSeedFile(database: DatabaseSync, spec: (typeof DEMO_SEED_FILES)[number]): Promise<void> {
   const pdfModule = await import("pdf-parse/lib/pdf-parse.js");
   const pdfParse = pdfModule.default as (buffer: Buffer) => Promise<{ text: string }>;
-  const sourcePath = path.join(PDF_DIR, spec.pdfName);
+  const sourcePath = path.resolve(PDF_DIR, spec.sourceRelativePath || spec.pdfName);
   const buffer = await readFile(sourcePath);
   const sha256 = createHash("sha256").update(buffer).digest("hex");
   const text = normalizeText((await pdfParse(buffer)).text);
@@ -116,7 +116,7 @@ async function importSeedFile(database: DatabaseSync, spec: (typeof DEMO_SEED_FI
 
 function buildDefaultWorkspaceState() {
   return {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     config: deepCloneConfig(DEFAULT_CONFIG),
     profiles: deepCloneUserProfiles(),
     versions: [],
@@ -146,7 +146,7 @@ async function main(): Promise<void> {
   await mkdir(PDF_DIR, { recursive: true });
   await mkdir(DATA_DIR, { recursive: true });
   for (const spec of DEMO_SEED_FILES) {
-    await readFile(path.join(PDF_DIR, spec.pdfName));
+    await readFile(path.resolve(PDF_DIR, spec.sourceRelativePath || spec.pdfName));
   }
 
   const database = new DatabaseSync(DB_PATH);

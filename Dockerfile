@@ -22,6 +22,7 @@ COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --chown=nextjs:nodejs data ./data
+COPY --from=builder --chown=nextjs:nodejs /app/docs ./docs
 COPY --chown=nextjs:nodejs output ./output
 USER nextjs
 EXPOSE 3000

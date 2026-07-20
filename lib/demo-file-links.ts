@@ -7,7 +7,7 @@ function clone<T>(value: T): T {
 
 const DEMO_FILE_IDS = new Set(DEMO_SEED_FILES.map((file) => file.id));
 
-/** 把已入库的模拟 PDF 重新挂回对应 A/B 预设资料，修复旧数据里 fileIds 为空或挂错资料的问题。 */
+/** 把已入库的模拟 PDF 重新挂回对应预设资料，修复旧数据里 fileIds 为空或挂错资料的问题。 */
 export function attachPresetDemoFileIds(
   profiles: UserProfileLibrary,
   readyFileIds: ReadonlySet<string>,

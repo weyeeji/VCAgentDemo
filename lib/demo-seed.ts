@@ -45,7 +45,7 @@ async function importSeedFile(
 ): Promise<void> {
   const pdfModule = await import("pdf-parse/lib/pdf-parse.js");
   const pdfParse = pdfModule.default as (buffer: Buffer) => Promise<{ text: string }>;
-  const sourcePath = path.join(pdfDir, spec.pdfName);
+  const sourcePath = path.resolve(pdfDir, spec.sourceRelativePath || spec.pdfName);
   const buffer = await readFile(sourcePath);
   const sha256 = createHash("sha256").update(buffer).digest("hex");
   const text = normalizeText((await pdfParse(buffer)).text);
@@ -97,7 +97,7 @@ export async function ensureDemoSeedFiles(database: DatabaseSync, uploadDir: str
       }
     }
     try {
-      await access(path.join(pdfDir, spec.pdfName));
+      await access(path.resolve(pdfDir, spec.sourceRelativePath || spec.pdfName));
     } catch {
       continue;
     }

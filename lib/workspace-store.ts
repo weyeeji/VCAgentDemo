@@ -6,9 +6,12 @@ import { attachPresetDemoFileIds } from "./demo-file-links";
 import {
   buildCanonicalAgentCard,
   DEFAULT_CONFIG,
+  FIELD_DEFINITIONS,
   deepCloneConfig,
   deepCloneUserProfiles,
   isAgentCardField,
+  normalizeProfileFields,
+  selectiveDisclosureKey,
 } from "./defaults";
 import type {
   AgentFileRecord,
@@ -86,7 +89,7 @@ function emptyDirectChats(): DirectChatState {
 
 function defaultState(): WorkspaceState {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     config: deepCloneConfig(DEFAULT_CONFIG),
     profiles: deepCloneUserProfiles(),
     versions: [],
@@ -308,7 +311,17 @@ function isDirectChatMessage(value: unknown): value is DirectChatMessage {
     && typeof value.content === "string" && typeof value.createdAt === "string" && isNullableId(value.callId)
     && isFiniteNonNegative(value.inputTokens) && isFiniteNonNegative(value.outputTokens)
     && typeof value.usageEstimated === "boolean" && isFiniteNonNegative(value.estimatedCost)
-    && Array.isArray(value.toolCalls) && value.toolCalls.every(isToolExecutionTrace);
+    && Array.isArray(value.toolCalls) && value.toolCalls.every(isToolExecutionTrace)
+    && (value.proposedActions === undefined || (Array.isArray(value.proposedActions) && value.proposedActions.length <= 20
+      && value.proposedActions.every((action) => isObject(action) && isNonEmptyShortString(action.id)
+        && ["memory.create", "memory.update", "memory.archive", "task.create", "task.update", "task.cancel"].includes(String(action.type))
+        && typeof action.reason === "string" && isObject(action.input)
+        && (action.memoryId === undefined || isNonEmptyShortString(action.memoryId))
+        && (action.taskId === undefined || isNonEmptyShortString(action.taskId)))))
+    && (value.actionStatus === undefined || ["pending", "applied", "rejected", "failed"].includes(String(value.actionStatus)))
+    && (value.actionError === undefined || value.actionError === null || typeof value.actionError === "string")
+    && (value.actionsAppliedAt === undefined || value.actionsAppliedAt === null || typeof value.actionsAppliedAt === "string")
+    && (value.workingContextSnapshot === undefined || value.workingContextSnapshot === null || isProfileJson(value.workingContextSnapshot));
 }
 
 function isDirectChatThread(value: unknown, expectedRole: "investor" | "founder"): value is DirectChatThread {
@@ -375,11 +388,14 @@ function isStoredConfig(value: unknown): value is AppConfig {
 }
 
 function isStrictConfig(value: unknown): value is AppConfig {
-  const keys = ["investor", "founder", "settings", "evaluatorPrompt", "memoryPrompts", "jsonRepairPrompt", "dailyReport"];
+  const keys = ["investor", "founder", "settings", "evaluatorPrompt", "directChatTaskPrompts", "memoryPrompts", "jsonRepairPrompt", "dailyReport"];
   if (!isObject(value) || Object.keys(value).length !== keys.length || Object.keys(value).some((key) => !keys.includes(key))
     || !isAgentProfile(value.investor, "investor") || !isAgentProfile(value.founder, "founder")
     || value.investor.id === value.founder.id || !isRunSettings(value.settings)
     || typeof value.evaluatorPrompt !== "string" || value.evaluatorPrompt.length > 200_000
+    || !isObject(value.directChatTaskPrompts) || Object.keys(value.directChatTaskPrompts).length !== 2
+    || typeof value.directChatTaskPrompts.investor !== "string" || value.directChatTaskPrompts.investor.length > 200_000
+    || typeof value.directChatTaskPrompts.founder !== "string" || value.directChatTaskPrompts.founder.length > 200_000
     || typeof value.jsonRepairPrompt !== "string" || value.jsonRepairPrompt.length > 200_000
     || !isObject(value.memoryPrompts) || Object.keys(value.memoryPrompts).length !== 2
     || typeof value.memoryPrompts.investor !== "string" || value.memoryPrompts.investor.length > 200_000
@@ -490,16 +506,43 @@ function normalizeProfiles(
   memories: unknown,
   dailyReports: unknown,
   updatedAt: unknown,
+  migrateSelectiveDefaults = false,
 ): UserProfileLibrary {
   const timestamp = migrationTimestamp(updatedAt);
   if (!isUserProfileLibrary(value, false)) {
+    let recovered = migrateMissingProfiles(config, memories, dailyReports, timestamp);
+    if (migrateSelectiveDefaults) recovered = publishSelectiveFieldsByDefault(recovered, timestamp);
     return attachPresetDemoFileIds(
-      migrateMissingProfiles(config, memories, dailyReports, timestamp),
+      recovered,
       listReadyAgentFileIds(),
       timestamp,
     );
   }
   const profiles = clone(value);
+  const defaultProfiles = deepCloneUserProfiles();
+  // 新增内置样例时只补齐缺失的预设，不覆盖或删除用户已有资料。
+  // 这样升级现有工作区也能看到新样例，同时保留历史虚拟数据和自定义资料。
+  (["investor", "founder"] as const).forEach((role) => {
+    const existingIds = new Set(profiles[role].map((profile) => profile.id));
+    const availableSlots = Math.max(0, MAX_USER_PROFILES_PER_ROLE - profiles[role].length);
+    const missingPresets = defaultProfiles[role]
+      .filter((profile) => !existingIds.has(profile.id))
+      .slice(0, availableSlots);
+    if (missingPresets.length) profiles[role] = [...profiles[role], ...missingPresets];
+  });
+  // 旧版本内置预设包含大量不在设计稿中的字段。仅当预设仍带有
+  // 非当前 DOCX schema 的键或非法选项时，用新版内置值做一次迁移；
+  // 已经按当前 schema 编辑过的预设不会被覆盖。
+  (["investor", "founder"] as const).forEach((role) => {
+    const defaultsById = new Map(defaultProfiles[role].map((profile) => [profile.id, profile]));
+    profiles[role] = profiles[role].map((profile) => {
+      const defaultProfile = profile.kind === "preset" ? defaultsById.get(profile.id) : undefined;
+      if (!defaultProfile) return profile;
+      const normalizedFields = normalizeProfileFields(role, profile.fields);
+      if (isDeepStrictEqual(normalizedFields, profile.fields)) return profile;
+      return { ...profile, fields: clone(defaultProfile.fields), updatedAt: timestamp };
+    });
+  });
   (["investor", "founder"] as const).forEach((role) => {
     const seenFileIds = new Set<string>();
     profiles[role] = profiles[role].map((profile) => {
@@ -526,7 +569,22 @@ function normalizeProfiles(
   const resolved = isUserProfileLibrary(profiles)
     ? profiles
     : migrateMissingProfiles(config, memories, dailyReports, timestamp);
-  return attachPresetDemoFileIds(resolved, listReadyAgentFileIds(), timestamp);
+  const migrated = migrateSelectiveDefaults ? publishSelectiveFieldsByDefault(resolved, timestamp) : resolved;
+  return attachPresetDemoFileIds(migrated, listReadyAgentFileIds(), timestamp);
+}
+
+function publishSelectiveFieldsByDefault(profiles: UserProfileLibrary, timestamp: string): UserProfileLibrary {
+  const next = clone(profiles);
+  (["investor", "founder"] as const).forEach((role) => {
+    next[role] = next[role].map((profile) => {
+      const fields = clone(profile.fields);
+      FIELD_DEFINITIONS[role]
+        .filter((field) => field.visibility === "selective")
+        .forEach((field) => { fields[selectiveDisclosureKey(field.key)] = "true"; });
+      return { ...profile, fields: normalizeProfileFields(role, fields), updatedAt: timestamp };
+    });
+  });
+  return next;
 }
 
 function isStoredVersion(value: unknown): value is SavedVersion {
@@ -561,12 +619,31 @@ function normalizeStoredState(value: unknown): WorkspaceState {
   const fallback = defaultState();
   if (!isObject(value)) return fallback;
   const config = isStoredConfig(value.config) ? clone(value.config) : fallback.config;
+  const storedDirectChatPrompts: Record<string, unknown> = isObject(config.directChatTaskPrompts) ? config.directChatTaskPrompts : {};
+  config.directChatTaskPrompts = {
+    investor: typeof storedDirectChatPrompts.investor === "string"
+      ? storedDirectChatPrompts.investor.slice(0, 200_000)
+      : fallback.config.directChatTaskPrompts.investor,
+    founder: typeof storedDirectChatPrompts.founder === "string"
+      ? storedDirectChatPrompts.founder.slice(0, 200_000)
+      : fallback.config.directChatTaskPrompts.founder,
+  };
   const memories = isRolePair(value.memories) ? clone(value.memories) : fallback.memories;
   const dailyReports = isRolePair(value.dailyReports) ? clone(value.dailyReports) : fallback.dailyReports;
+  const profiles = normalizeProfiles(value.profiles, config, memories, dailyReports, value.updatedAt, value.schemaVersion !== 2);
+  (["investor", "founder"] as const).forEach((role) => {
+    const activeProfile = profiles[role].find((profile) => profile.id === config[role].id) || profiles[role][0];
+    config[role] = {
+      ...config[role],
+      id: activeProfile.id,
+      fields: clone(activeProfile.fields),
+      prompts: { ...config[role].prompts, dynamic: clone(activeProfile.dynamicLayer) },
+    };
+  });
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     config,
-    profiles: normalizeProfiles(value.profiles, config, memories, dailyReports, value.updatedAt),
+    profiles,
     versions: Array.isArray(value.versions) ? value.versions.filter(isStoredVersion).slice(0, MAX_VERSIONS) : [],
     records: Array.isArray(value.records) ? value.records.filter(isSimulationRecord).slice(0, MAX_RECORDS) : [],
     directChats: normalizeDirectChats(value.directChats),
@@ -690,7 +767,7 @@ export function saveWorkspaceState(patch: WorkspaceStatePatch, expectedUpdatedAt
       };
     });
     const next: WorkspaceState = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       config,
       profiles,
       versions: patch.versions ? clone(patch.versions) : clone(current.versions),

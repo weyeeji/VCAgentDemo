@@ -1,6 +1,80 @@
 export type AgentRole = "investor" | "founder";
 export type LayerKey = "platform" | "tools" | "user" | "task" | "dynamic";
 
+export type MemoryKind = "fact" | "preference" | "decision" | "constraint" | "note";
+export type MemoryVerification = "confirmed" | "unverified" | "conflicted";
+export type MemoryStatus = "active" | "superseded" | "archived" | "deleted";
+export type AgentTaskStatus = "todo" | "in_progress" | "blocked" | "done" | "cancelled";
+
+export interface AgentMemoryItem {
+  id: string;
+  scopeId: string;
+  agentId: string;
+  agentRole: AgentRole;
+  kind: MemoryKind;
+  title: string;
+  content: string;
+  verification: MemoryVerification;
+  status: MemoryStatus;
+  priority: number;
+  counterpartyId: string | null;
+  sourceType: string;
+  sourceId: string | null;
+  metadata: Record<string, unknown>;
+  supersedesId: string | null;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt: string | null;
+}
+
+export interface AgentTaskItem {
+  id: string;
+  scopeId: string;
+  agentId: string;
+  agentRole: AgentRole;
+  title: string;
+  description: string;
+  status: AgentTaskStatus;
+  priority: number;
+  dueAt: string | null;
+  counterpartyId: string | null;
+  sourceMemoryId: string | null;
+  sourceType: string;
+  sourceId: string | null;
+  metadata: Record<string, unknown>;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type AgentActionType =
+  | "memory.create"
+  | "memory.update"
+  | "memory.archive"
+  | "task.create"
+  | "task.update"
+  | "task.cancel";
+
+export interface AgentActionProposal {
+  id: string;
+  type: AgentActionType;
+  reason: string;
+  memoryId?: string;
+  taskId?: string;
+  input: Record<string, unknown>;
+}
+
+export interface WorkingContextSnapshot {
+  agentId: string;
+  counterpartyId: string | null;
+  generatedAt: string;
+  version: string;
+  memories: AgentMemoryItem[];
+  tasks: AgentTaskItem[];
+  promptText: string;
+}
+
 export interface PromptVariant {
   id: string;
   name: string;
@@ -64,6 +138,7 @@ export interface AppConfig {
   founder: AgentProfile;
   settings: RunSettings;
   evaluatorPrompt: string;
+  directChatTaskPrompts: Record<AgentRole, string>;
   memoryPrompts: Record<AgentRole, string>;
   jsonRepairPrompt: string;
   dailyReport: Record<AgentRole, DailyReportConfig>;
@@ -204,6 +279,12 @@ export interface DirectChatMessage {
   usageEstimated: boolean;
   estimatedCost: number;
   toolCalls: ToolExecutionTrace[];
+  /** Agent 提议的记忆或任务变更；必须由用户确认后才执行。 */
+  proposedActions?: AgentActionProposal[];
+  actionStatus?: "pending" | "applied" | "rejected" | "failed";
+  actionError?: string | null;
+  actionsAppliedAt?: string | null;
+  workingContextSnapshot?: WorkingContextSnapshot | null;
 }
 
 export interface DirectChatThread {
@@ -262,7 +343,7 @@ export interface SavedVersion {
 }
 
 export interface WorkspaceState {
-  schemaVersion: 1;
+  schemaVersion: 2;
   config: AppConfig;
   profiles: UserProfileLibrary;
   versions: SavedVersion[];
@@ -280,12 +361,14 @@ export type WorkspaceStatePatch = Partial<Pick<WorkspaceState,
 >>;
 
 export type FieldInputType = "text" | "textarea" | "select" | "multiselect" | "date";
+export type FieldVisibility = "public" | "selective" | "private";
 
 export interface FieldDefinition {
   key: string;
   label: string;
   input: FieldInputType;
   required: boolean;
+  visibility: FieldVisibility;
   options?: string[];
   exclusiveOptions?: string[];
   maxSelections?: number;

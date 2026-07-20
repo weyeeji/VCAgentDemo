@@ -5,6 +5,8 @@ export interface DemoSeedFileSpec {
   role: AgentRole;
   profileId: string;
   pdfName: string;
+  /** 相对 output/pdf 的源文件路径；省略时直接使用 pdfName。 */
+  sourceRelativePath?: string;
 }
 
 /** 预置模拟 PDF 使用固定 ID，便于提交 data/ 后在服务器直接关联资料。 */
@@ -44,6 +46,13 @@ export const DEMO_SEED_FILES: DemoSeedFileSpec[] = [
     role: "founder",
     profileId: "founder-demo-002",
     pdfName: "founder_financial_appendix_medical_cn.pdf",
+  },
+  {
+    id: "c2222222-2222-4222-8222-222222220001",
+    role: "founder",
+    profileId: "founder-demo-003",
+    pdfName: "小友智心介绍20260608.pdf",
+    sourceRelativePath: "../../docs/小友智心介绍20260608.pdf",
   },
 ];
 

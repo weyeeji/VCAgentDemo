@@ -22,6 +22,10 @@ rm -rf "$STANDALONE_DIR/.next/static"
 cp -r "$ROOT_DIR/.next/static" "$STANDALONE_DIR/.next/static"
 rm -rf "$STANDALONE_DIR/public"
 cp -r "$ROOT_DIR/public" "$STANDALONE_DIR/public"
+rm -rf "$STANDALONE_DIR/output"
+cp -r "$ROOT_DIR/output" "$STANDALONE_DIR/output"
+rm -rf "$STANDALONE_DIR/docs"
+cp -r "$ROOT_DIR/docs" "$STANDALONE_DIR/docs"
 
 if [[ -f "$ROOT_DIR/.env" ]]; then
   cp "$ROOT_DIR/.env" "$STANDALONE_DIR/.env"

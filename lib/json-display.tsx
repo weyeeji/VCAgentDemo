@@ -100,6 +100,35 @@ function statusTone(status: string): string {
   return "neutral";
 }
 
+function renderMemoryActions(data: Record<string, unknown>, owner: "投资人" | "创业者") {
+  const actions = Array.isArray(data.actions) ? data.actions.filter(isObject) : [];
+  const labels: Record<string, string> = {
+    "memory.create": "新增",
+    "memory.update": "修改",
+    "memory.archive": "归档",
+    "memory.restore": "恢复",
+  };
+  const items = actions.map((action) => {
+    const input = isObject(action.input) ? action.input : {};
+    const operation = labels[asString(action.type)] || asString(action.type) || "记忆操作";
+    const title = asString(input.title) || asString(action.memoryId) || "未命名记忆";
+    const content = asString(input.content);
+    const reason = asString(action.reason);
+    return `${operation} · ${title}${content ? `：${content}` : ""}${reason ? `（${reason}）` : ""}`;
+  });
+  return (
+    <div className="json-read-body">
+      <div className="json-read-hero">
+        <div>
+          <p className="json-read-kicker">{owner} Agent 自主记忆维护</p>
+          <h3>{items.length ? `本轮执行 ${items.length} 项长期记忆操作` : "本轮没有需要更新的长期记忆"}</h3>
+        </div>
+      </div>
+      <Section title="记忆操作"><BulletList items={items} empty="无需变更" /></Section>
+    </div>
+  );
+}
+
 function renderPublicEvaluation(data: Record<string, unknown>) {
   const status = asString(data.status) || "未知";
   const matchScore = asNumber(data.match_score);
@@ -136,6 +165,7 @@ function renderPublicEvaluation(data: Record<string, unknown>) {
 }
 
 function renderInvestorMemory(data: Record<string, unknown>) {
+  if (Array.isArray(data.actions)) return renderMemoryActions(data, "投资人");
   const fit = isObject(data.investment_fit) ? data.investment_fit : {};
   return (
     <div className="json-read-body">
@@ -167,6 +197,7 @@ function renderInvestorMemory(data: Record<string, unknown>) {
 }
 
 function renderFounderMemory(data: Record<string, unknown>) {
+  if (Array.isArray(data.actions)) return renderMemoryActions(data, "创业者");
   const fit = isObject(data.investor_fit) ? data.investor_fit : {};
   return (
     <div className="json-read-body">

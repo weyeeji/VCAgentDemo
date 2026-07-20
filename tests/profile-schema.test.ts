@@ -7,6 +7,7 @@ import {
   FIELD_DEFINITIONS,
   buildAgentCard,
   composeDirectChatPrompt,
+  composePrompt,
   normalizeProfileFields,
   selectiveDisclosureKey,
 } from "../lib/defaults";
@@ -97,4 +98,26 @@ test("用户直聊任务层 replaces the normal dual-Agent task layer", () => {
   assert.match(prompt, /当前消息来自创建、配置和管理本 Agent 的用户/);
   assert.match(DIRECT_CHAT_TASK_PROMPTS.founder, /不得把用户当成投资人/);
   assert.match(DIRECT_CHAT_TASK_PROMPTS.investor, /不得把用户当成创业者/);
+  assert.match(prompt, /自动事务执行/);
+  assert.doesNotMatch(prompt, /只有用户确认后/);
+});
+
+test("双 Agent 提示词注入同一关系的摘要和最近发言", () => {
+  const prompt = composePrompt(DEFAULT_CONFIG.investor, DEFAULT_CONFIG.settings, null, {
+    relationshipId: "relationship-test",
+    episodeNumber: 3,
+    previousConversationId: "conv-2",
+    summary: "双方已经讨论产品 Demo。",
+    recentTurns: [{
+      role: "founder",
+      agentName: "创业者",
+      round: 2,
+      content: "下次补充客户数据。",
+      createdAt: "2026-07-20T00:00:00.000Z",
+    }],
+    relationshipVersion: 2,
+  });
+  assert.match(prompt, /第 3 次对接/);
+  assert.match(prompt, /双方已经讨论产品 Demo/);
+  assert.match(prompt, /下次补充客户数据/);
 });

@@ -1,15 +1,22 @@
 import { getWorkspaceState } from "./workspace-store";
+import { migrateMemoryScope } from "./memory-store";
+import { migrateRelationshipScope } from "./relationship-store";
 import type { AgentRole } from "./types";
 
 export const NO_STORE = { "Cache-Control": "no-store" };
 export const MEMORY_SCOPE_HEADER = "x-agent-memory-scope";
+export const STABLE_MEMORY_SCOPE = "workspace-default-v1";
 
 export function memoryScopeFromRequest(request: Request): string {
   const value = request.headers.get(MEMORY_SCOPE_HEADER)?.trim() || "";
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/.test(value)) {
     throw new Error("缺少有效的 Agent Memory 作用域。");
   }
-  return value;
+  if (value !== STABLE_MEMORY_SCOPE) {
+    migrateMemoryScope(value, STABLE_MEMORY_SCOPE);
+    migrateRelationshipScope(value, STABLE_MEMORY_SCOPE);
+  }
+  return STABLE_MEMORY_SCOPE;
 }
 
 export function resolveAgent(agentId: string): { id: string; role: AgentRole } {
@@ -28,4 +35,3 @@ export async function jsonBody(request: Request, maxChars = 200_000): Promise<Re
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("请求体必须是 JSON 对象。");
   return parsed as Record<string, unknown>;
 }
-

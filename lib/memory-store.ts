@@ -192,6 +192,13 @@ function db(): DatabaseSync {
       created_at TEXT NOT NULL,
       UNIQUE(scope_id, agent_id, source_type, source_id)
     );
+
+    CREATE TABLE IF NOT EXISTS agent_memory_scope_migrations (
+      source_scope_id TEXT NOT NULL,
+      target_scope_id TEXT NOT NULL,
+      migrated_at TEXT NOT NULL,
+      PRIMARY KEY(source_scope_id, target_scope_id)
+    );
   `);
   globalThis.__ventureMemoryDb = database;
   return database;
@@ -502,6 +509,30 @@ function transaction<T>(work: (database: DatabaseSync) => T): T {
   }
 }
 
+/**
+ * Move a legacy browser-local scope into the stable workspace scope once.
+ * Existing stable rows win on idempotency-key conflicts; conflicting legacy
+ * rows remain in the old scope instead of being overwritten.
+ */
+export function migrateMemoryScope(sourceScopeId: string, targetScopeId: string): void {
+  if (sourceScopeId === targetScopeId) return;
+  transaction((database) => {
+    const completed = database.prepare(`SELECT 1 FROM agent_memory_scope_migrations
+      WHERE source_scope_id = ? AND target_scope_id = ?`).get(sourceScopeId, targetScopeId);
+    if (completed) return;
+    database.prepare("UPDATE OR IGNORE agent_memories SET scope_id = ? WHERE scope_id = ?")
+      .run(targetScopeId, sourceScopeId);
+    database.prepare("UPDATE OR IGNORE agent_tasks SET scope_id = ? WHERE scope_id = ?")
+      .run(targetScopeId, sourceScopeId);
+    database.prepare("UPDATE OR IGNORE agent_state_events SET scope_id = ? WHERE scope_id = ?")
+      .run(targetScopeId, sourceScopeId);
+    database.prepare("UPDATE OR IGNORE agent_action_batches SET scope_id = ? WHERE scope_id = ?")
+      .run(targetScopeId, sourceScopeId);
+    database.prepare(`INSERT INTO agent_memory_scope_migrations (source_scope_id, target_scope_id, migrated_at)
+      VALUES (?, ?, ?)`).run(sourceScopeId, targetScopeId, now());
+  });
+}
+
 export function listMemories(scopeId: string, agentId: string, options: {
   status?: MemoryStatus | "all";
   kind?: MemoryKind;
@@ -590,6 +621,7 @@ export function commitAgentActions(
   if (!actions.length || actions.length > 20) throw new Error("一次必须执行 1–20 个行动。");
   const normalizedSourceType = cleanText(sourceType, "sourceType", 100);
   const normalizedSourceId = cleanOptionalText(sourceId, "sourceId");
+  const isSimulation = normalizedSourceType === "simulation";
   return transaction((database) => {
     if (normalizedSourceId) {
       const existing = database.prepare(`SELECT result_json FROM agent_action_batches
@@ -606,11 +638,13 @@ export function commitAgentActions(
           kind: action.input.kind as MemoryKind,
           title: action.input.title as string,
           content: action.input.content as string,
-          verification: "confirmed",
+          verification: isSimulation
+            ? (action.input.verification === "conflicted" ? "conflicted" : "unverified")
+            : "confirmed",
           priority: action.input.priority as number | undefined,
           counterpartyId: action.input.counterpartyId as string | null | undefined,
           supersedesId: action.input.supersedesId as string | null | undefined,
-          metadata: { ...cleanMetadata(action.input.metadata), approvedActionId: action.id, reason: action.reason },
+          metadata: { ...cleanMetadata(action.input.metadata), autonomousActionId: action.id, reason: action.reason },
           sourceType: normalizedSourceType,
           sourceId: actionSourceId,
         }));
@@ -619,22 +653,34 @@ export function commitAgentActions(
         if (!Number.isInteger(action.input.expectedVersion) || Number(action.input.expectedVersion) < 1) {
           throw new Error("memory.update 缺少有效的 expectedVersion。");
         }
+        const existingMemory = getMemoryRow(database, scopeId, agentId, action.memoryId);
+        if (!existingMemory) throw new Error("记忆不存在或不属于当前 Agent。");
+        if (isSimulation && existingMemory.verification === "confirmed") {
+          throw new Error("模拟对话不能自动改写用户已确认的记忆；应新建 conflicted 条目。");
+        }
         memories.push(updateMemoryInternal(database, scopeId, agentId, action.memoryId, {
           ...(action.input.kind === undefined ? {} : { kind: action.input.kind as MemoryKind }),
           ...(action.input.title === undefined ? {} : { title: action.input.title as string }),
           ...(action.input.content === undefined ? {} : { content: action.input.content as string }),
           ...(action.input.priority === undefined ? {} : { priority: action.input.priority as number }),
           ...(action.input.counterpartyId === undefined ? {} : { counterpartyId: action.input.counterpartyId as string | null }),
-          verification: "confirmed",
+          verification: isSimulation
+            ? (action.input.verification === "conflicted" ? "conflicted" : "unverified")
+            : "confirmed",
           expectedVersion: action.input.expectedVersion as number | undefined,
         }, normalizedSourceType, actionSourceId));
-      } else if (action.type === "memory.archive") {
-        if (!action.memoryId) throw new Error("memory.archive 缺少 memoryId。");
+      } else if (action.type === "memory.archive" || action.type === "memory.restore") {
+        if (!action.memoryId) throw new Error(`${action.type} 缺少 memoryId。`);
         if (!Number.isInteger(action.input.expectedVersion) || Number(action.input.expectedVersion) < 1) {
-          throw new Error("memory.archive 缺少有效的 expectedVersion。");
+          throw new Error(`${action.type} 缺少有效的 expectedVersion。`);
+        }
+        const existingMemory = getMemoryRow(database, scopeId, agentId, action.memoryId);
+        if (!existingMemory) throw new Error("记忆不存在或不属于当前 Agent。");
+        if (isSimulation && existingMemory.verification === "confirmed") {
+          throw new Error("模拟对话不能自动归档或恢复用户已确认的记忆。");
         }
         memories.push(updateMemoryInternal(database, scopeId, agentId, action.memoryId, {
-          status: "archived",
+          status: action.type === "memory.restore" ? "active" : "archived",
           expectedVersion: action.input.expectedVersion as number | undefined,
         }, normalizedSourceType, actionSourceId));
       } else if (action.type === "task.create") {
@@ -646,7 +692,7 @@ export function commitAgentActions(
           dueAt: action.input.dueAt as string | null | undefined,
           counterpartyId: action.input.counterpartyId as string | null | undefined,
           sourceMemoryId: action.input.sourceMemoryId as string | null | undefined,
-          metadata: { ...cleanMetadata(action.input.metadata), approvedActionId: action.id, reason: action.reason },
+          metadata: { ...cleanMetadata(action.input.metadata), autonomousActionId: action.id, reason: action.reason },
           sourceType: normalizedSourceType,
           sourceId: actionSourceId,
         }));

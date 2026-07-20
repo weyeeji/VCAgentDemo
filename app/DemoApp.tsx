@@ -27,6 +27,7 @@ import type {
   AgentFileRecord,
   AgentActionProposal,
   AgentMemoryItem,
+  AgentRelationship,
   AgentRole,
   AgentTaskItem,
   AgentTaskStatus,
@@ -40,6 +41,8 @@ import type {
   LayerKey,
   FieldDefinition,
   PromptVariant,
+  RelationshipContinuationSnapshot,
+  RelationshipRecentTurn,
   SavedVersion,
   SimulationRecord,
   TurnControl,
@@ -78,6 +81,46 @@ type SaveStatus = "loading" | "saved" | "saving" | "error";
 
 function otherRole(role: AgentRole): AgentRole {
   return role === "investor" ? "founder" : "investor";
+}
+
+function continuationFromRelationship(
+  relationship: AgentRelationship,
+  includeHistory = true,
+): RelationshipContinuationSnapshot {
+  return {
+    relationshipId: relationship.id,
+    episodeNumber: relationship.episodeCount + 1,
+    previousConversationId: includeHistory ? relationship.lastConversationId : null,
+    summary: includeHistory ? relationship.summary : "",
+    recentTurns: includeHistory ? clone(relationship.recentTurns) : [],
+    relationshipVersion: relationship.version,
+  };
+}
+
+function buildRelationshipSummary(record: SimulationRecord): string {
+  const previous = record.continuationSnapshot?.summary.trim() || "";
+  const useful = record.messages.slice(-8).map((message) =>
+    `${message.role === "investor" ? "投资人" : "创业者"}：${message.content.slice(0, 600)}`,
+  );
+  const summary = [
+    ...(previous ? [`此前累计上下文：\n${previous}`] : []),
+    "最近一次对接：",
+    `上次对接结束原因：${record.endReason || "unknown"}。`,
+    ...useful,
+  ].join("\n");
+  if (summary.length <= 12_000) return summary;
+  const marker = "（较早的关系摘要已按上下文上限截断）\n";
+  return `${marker}${summary.slice(-(12_000 - marker.length))}`;
+}
+
+function relationshipRecentTurns(record: SimulationRecord): RelationshipRecentTurn[] {
+  return record.messages.slice(-12).map((message) => ({
+    role: message.role,
+    agentName: message.agentName,
+    round: message.round,
+    content: message.content,
+    createdAt: message.createdAt,
+  }));
 }
 
 function emptyDirectChats(): DirectChatState {
@@ -487,7 +530,18 @@ function normalizeLegacyRecords(value: unknown): { items: SimulationRecord[]; di
         && isDemoAgentCard(record.agentCardSnapshots.founder, "founder")
         ? clone(record.agentCardSnapshots) as Record<AgentRole, DemoAgentCard>
         : { investor: buildAgentCard(configSnapshot.investor), founder: buildAgentCard(configSnapshot.founder) };
-      return [{ ...clone(record), configSnapshot, agentCardSnapshots: existingCards }];
+      return [{
+        ...clone(record),
+        configSnapshot,
+        agentCardSnapshots: existingCards,
+        relationshipId: typeof record.relationshipId === "string" ? record.relationshipId : null,
+        parentConversationId: typeof record.parentConversationId === "string" ? record.parentConversationId : null,
+        episodeNumber: Number.isInteger(record.episodeNumber) && Number(record.episodeNumber) > 0 ? Number(record.episodeNumber) : 1,
+        continuationSnapshot: isPlainObject(record.continuationSnapshot)
+          ? clone(record.continuationSnapshot as unknown as RelationshipContinuationSnapshot)
+          : null,
+        replayOfConversationId: typeof record.replayOfConversationId === "string" ? record.replayOfConversationId : null,
+      }];
     } catch {
       return [];
     }
@@ -689,7 +743,7 @@ function assertTurnReply(value: unknown): Record<string, unknown> {
 }
 
 const AGENT_ACTION_TYPES = new Set([
-  "memory.create", "memory.update", "memory.archive", "task.create", "task.update", "task.cancel",
+  "memory.create", "memory.update", "memory.archive", "memory.restore", "task.create", "task.update", "task.cancel",
 ]);
 
 function normalizeAgentActions(value: unknown): AgentActionProposal[] {
@@ -1066,7 +1120,7 @@ function AgentStatePanel({
   </div>;
 }
 
-function DirectChatPanel({ role, state, taskPrompt, busy, disabled, newChatDisabled, error, onTaskPromptChange, onResetTaskPrompt, onNew, onSelect, onDelete, onSend, onPreviewCall, onPreviewPrompt, onApplyActions, onRejectActions }: {
+function DirectChatPanel({ role, state, taskPrompt, busy, disabled, newChatDisabled, error, onTaskPromptChange, onResetTaskPrompt, onNew, onSelect, onDelete, onSend, onPreviewCall, onPreviewPrompt, onApplyActions }: {
   role: AgentRole;
   state: DirectChatRoleState;
   taskPrompt: string;
@@ -1083,7 +1137,6 @@ function DirectChatPanel({ role, state, taskPrompt, busy, disabled, newChatDisab
   onPreviewCall: (call: DebugCall) => void;
   onPreviewPrompt: (thread: DirectChatThread) => void;
   onApplyActions: (threadId: string, messageId: string, actions: AgentActionProposal[]) => Promise<void>;
-  onRejectActions: (threadId: string, messageId: string) => void;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -1108,7 +1161,7 @@ function DirectChatPanel({ role, state, taskPrompt, busy, disabled, newChatDisab
     <div className="direct-chat-task-layer">
       <div><span>任务层 · 替换普通任务层</span><strong>用户直聊专用提示词</strong><button disabled={disabled || busy} onClick={onResetTaskPrompt}>恢复默认</button></div>
       <textarea aria-label={`${ROLE_LABEL[role]}用户直聊任务层`} value={taskPrompt} disabled={disabled || busy} onChange={(event) => onTaskPromptChange(event.target.value)} />
-      <p>这里的内容会完全替换双 Agent 模拟使用的普通任务层，并从下一条用户消息开始生效；平台规定的 JSON 与 actions 输出格式仍会自动追加。</p>
+      <p>这里的内容会完全替换双 Agent 模拟使用的普通任务层；Agent 产生的 Memory / 任务 actions 会在回复成功后自动事务执行。</p>
     </div>
     {state.threads.length > 0 && <div className="direct-chat-history">
       <label>当前对话<select value={active?.id || ""} disabled={disabled || busy} onChange={(event) => onSelect(event.target.value)}>{state.threads.map((thread, index) => <option key={thread.id} value={thread.id}>对话 {state.threads.length - index} · {new Date(thread.createdAt).toLocaleString("zh-CN")}</option>)}</select></label>
@@ -1117,18 +1170,19 @@ function DirectChatPanel({ role, state, taskPrompt, busy, disabled, newChatDisab
       <span>{active?.messages.length || 0} 条消息 · 无平台轮次上限</span>
     </div>}
     <div className="direct-chat-messages">
-      {!active ? <div className="direct-chat-empty"><strong>还没有用户测试对话</strong><p>创建后可向 Agent 补充信息或下达命令；Agent 可提议修改 Memory / 任务，但只有你确认后才会执行。</p></div> : active.messages.length ? active.messages.map((message) => {
+      {!active ? <div className="direct-chat-empty"><strong>还没有用户测试对话</strong><p>创建后可向 Agent 补充信息或下达命令；对话中明确的长期信息会自动影响 Agent Memory。</p></div> : active.messages.length ? active.messages.map((message) => {
         const call = message.callId ? active.debugCalls.find((item) => item.id === message.callId) : null;
         const hits = message.toolCalls.reduce((sum, tool) => sum + tool.results.length, 0);
         return <article className={`direct-chat-message ${message.role}`} key={message.id}>
           <header><strong>{message.role === "user" ? "你" : active.agentSnapshot.fields.agentName || ROLE_LABEL[role]}</strong><time>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour12: false })}</time></header>
           <p>{message.content}</p>
           {message.role === "assistant" && message.proposedActions?.length ? <div className={`direct-chat-proposals ${message.actionStatus || "pending"}`}>
-            <strong>Agent 提议执行 {message.proposedActions.length} 个行动</strong>
+            <strong>Agent 自主记忆操作 · {message.proposedActions.length} 项</strong>
             {message.proposedActions.map((action) => <div key={action.id}><code>{action.type}</code><span>{action.reason}</span><pre>{JSON.stringify(action.input, null, 2)}</pre></div>)}
             {message.actionError && <em>{message.actionError}</em>}
-            {(["pending", "failed"].includes(message.actionStatus || "pending")) ? <footer><button disabled={busy || disabled} onClick={() => void onApplyActions(active.id, message.id, message.proposedActions || [])}>{message.actionStatus === "failed" ? "重试执行" : "确认执行"}</button><button disabled={busy || disabled} onClick={() => onRejectActions(active.id, message.id)}>不执行</button></footer>
-              : <small>{message.actionStatus === "applied" ? `已执行${message.actionsAppliedAt ? ` · ${new Date(message.actionsAppliedAt).toLocaleString("zh-CN")}` : ""}` : message.actionStatus === "rejected" ? "用户已拒绝" : "执行失败"}</small>}
+            {message.actionStatus === "failed" ? <footer><button disabled={busy || disabled} onClick={() => void onApplyActions(active.id, message.id, message.proposedActions || [])}>重试自动执行</button></footer>
+              : message.actionStatus === "pending" ? <footer><button disabled={busy || disabled} onClick={() => void onApplyActions(active.id, message.id, message.proposedActions || [])}>执行旧版待处理操作</button></footer>
+                : <small>{message.actionStatus === "applied" ? `已自动执行${message.actionsAppliedAt ? ` · ${new Date(message.actionsAppliedAt).toLocaleString("zh-CN")}` : ""}` : "旧记录未执行"}</small>}
           </div> : null}
           {message.role === "assistant" && <footer>
             {message.toolCalls.length > 0 && <span className="direct-chat-tool">已调用工具 {message.toolCalls.length} 次 · 命中 {hits} 个片段</span>}
@@ -1352,7 +1406,7 @@ function AgentFilePanel({ role, files, disabled, onFilesChange }: {
 
 function AgentPanel({ role, config, onConfig, memories, tasks, agentStateLoading, onCreateMemory, onUpdateMemory, onArchiveMemory, onCreateTask, onUpdateTask,
   promptPreview, files, filesDisabled, onFilesChange,
-  chatState, chatBusy, chatDisabled, chatNewDisabled, chatError, onDirectChatTaskPromptChange, onNewChat, onSelectChat, onDeleteChat, onSendChat, onPreviewChatCall, onPreviewChatPrompt, onApplyChatActions, onRejectChatActions,
+  chatState, chatBusy, chatDisabled, chatNewDisabled, chatError, onDirectChatTaskPromptChange, onNewChat, onSelectChat, onDeleteChat, onSendChat, onPreviewChatCall, onPreviewChatPrompt, onApplyChatActions,
   profileOptions, onSelectProfile, onCreateProfile, onProfileDirty, onSaveProfile,
 }: {
   role: AgentRole;
@@ -1383,7 +1437,6 @@ function AgentPanel({ role, config, onConfig, memories, tasks, agentStateLoading
   onPreviewChatCall: (call: DebugCall) => void;
   onPreviewChatPrompt: (thread: DirectChatThread) => void;
   onApplyChatActions: (threadId: string, messageId: string, actions: AgentActionProposal[]) => Promise<void>;
-  onRejectChatActions: (threadId: string, messageId: string) => void;
   profileOptions: UserProfileRecord[];
   onSelectProfile: (profileId: string) => void;
   onCreateProfile: () => void;
@@ -1456,7 +1509,7 @@ function AgentPanel({ role, config, onConfig, memories, tasks, agentStateLoading
       <section className="agent-module files-module"><div className="module-heading"><div><strong>私有文件与工具</strong><span>详细材料由本 Agent 按问题检索，不公开给对方</span></div><span className="visibility-badge private">仅本 Agent</span></div><AgentFilePanel role={role} files={files} disabled={filesDisabled} onFilesChange={onFilesChange} /></section>
       <section className="agent-module prompts-module"><div className="module-heading"><div><strong>五层提示词</strong><span>动态层适合放不愿直接公开的限制与临时状态；不会进入 Agent Card</span></div><span>按固定顺序组合</span></div>{(Object.keys(LAYER_LABELS) as LayerKey[]).map((key) => <PromptLayerEditor key={key} role={role} layerKey={key} agent={agent} onChange={update} />)}</section>
       <section className="agent-module memory-module"><div className="module-heading"><div><strong>Memory 与任务状态</strong><span>结构化 CRUD；已确认决策自动进入下一次运行</span></div><span className="visibility-badge private">仅本 Agent</span></div><AgentStatePanel memories={memories} tasks={tasks} loading={agentStateLoading} disabled={filesDisabled} onCreateMemory={onCreateMemory} onUpdateMemory={onUpdateMemory} onArchiveMemory={onArchiveMemory} onCreateTask={onCreateTask} onUpdateTask={onUpdateTask} /></section>
-      <DirectChatPanel key={`${role}-${agent.id}-${chatState.activeThreadId || "none"}`} role={role} state={chatState} taskPrompt={config.directChatTaskPrompts[role]} busy={chatBusy} disabled={chatDisabled} newChatDisabled={chatNewDisabled} error={chatError} onTaskPromptChange={onDirectChatTaskPromptChange} onResetTaskPrompt={() => onDirectChatTaskPromptChange(DIRECT_CHAT_TASK_PROMPTS[role])} onNew={onNewChat} onSelect={onSelectChat} onDelete={onDeleteChat} onSend={onSendChat} onPreviewCall={onPreviewChatCall} onPreviewPrompt={onPreviewChatPrompt} onApplyActions={onApplyChatActions} onRejectActions={onRejectChatActions} />
+      <DirectChatPanel key={`${role}-${agent.id}-${chatState.activeThreadId || "none"}`} role={role} state={chatState} taskPrompt={config.directChatTaskPrompts[role]} busy={chatBusy} disabled={chatDisabled} newChatDisabled={chatNewDisabled} error={chatError} onTaskPromptChange={onDirectChatTaskPromptChange} onResetTaskPrompt={() => onDirectChatTaskPromptChange(DIRECT_CHAT_TASK_PROMPTS[role])} onNew={onNewChat} onSelect={onSelectChat} onDelete={onDeleteChat} onSend={onSendChat} onPreviewCall={onPreviewChatCall} onPreviewPrompt={onPreviewChatPrompt} onApplyActions={onApplyChatActions} />
     </section>
   );
 }
@@ -1527,6 +1580,7 @@ export default function DemoApp() {
   const [agentMemories, setAgentMemories] = useState<Record<AgentRole, AgentMemoryItem[]>>({ investor: [], founder: [] });
   const [agentTasks, setAgentTasks] = useState<Record<AgentRole, AgentTaskItem[]>>({ investor: [], founder: [] });
   const [agentContexts, setAgentContexts] = useState<Record<AgentRole, WorkingContextSnapshot | null>>({ investor: null, founder: null });
+  const [activeRelationship, setActiveRelationship] = useState<AgentRelationship | null>(null);
   const [agentStateLoading, setAgentStateLoading] = useState<Record<AgentRole, boolean>>({ investor: false, founder: false });
   const [dailyReports, setDailyReports] = useState<Record<AgentRole, unknown | null>>({ investor: null, founder: null });
   const [dailyBusy, setDailyBusy] = useState<AgentRole | null>(null);
@@ -1549,6 +1603,8 @@ export default function DemoApp() {
   const lastRunRef = useRef<AppConfig | null>(null);
   const lastRunFilesRef = useRef<Record<AgentRole, AgentFileRecord[]> | null>(null);
   const lastRunMemoriesRef = useRef<Record<AgentRole, unknown | null> | null>(null);
+  const lastRunContinuationRef = useRef<RelationshipContinuationSnapshot | null>(null);
+  const lastRunConversationIdRef = useRef<string | null>(null);
   const serverSnapshotRef = useRef<Record<string, string>>({});
   const serverRevisionRef = useRef<string | null>(null);
   const latestWorkspacePatchRef = useRef<WorkspaceStatePatch>({});
@@ -1639,6 +1695,28 @@ export default function DemoApp() {
       setErrors((current) => [...current, `读取 Agent Memory 失败：${caught instanceof Error ? caught.message : String(caught)}`]);
     });
   }, [auth, config.founder.id, config.investor.id, memoryScopeId, refreshAgentState, workspacePersisted, workspaceReady]);
+
+  useEffect(() => {
+    if (!workspaceReady || !workspacePersisted || auth !== "signed-in" || !memoryScopeId) return;
+    let cancelled = false;
+    const query = new URLSearchParams({
+      investorAgentId: config.investor.id,
+      founderAgentId: config.founder.id,
+    });
+    void agentStateRequest(`/api/relationships?${query.toString()}`)
+      .then((data) => {
+        if (!cancelled) setActiveRelationship(data.relationship && typeof data.relationship === "object"
+          ? clone(data.relationship as AgentRelationship)
+          : null);
+      })
+      .catch((caught) => {
+        if (!cancelled) setErrors((current) => {
+          const message = `读取连续对接状态失败：${caught instanceof Error ? caught.message : String(caught)}`;
+          return current.includes(message) ? current : [...current, message];
+        });
+      });
+    return () => { cancelled = true; };
+  }, [agentStateRequest, auth, config.founder.id, config.investor.id, memoryScopeId, workspacePersisted, workspaceReady]);
 
   useEffect(() => {
     if (!workspaceReady || !workspacePersisted || auth !== "signed-in" || !memoryScopeId) return;
@@ -1991,6 +2069,8 @@ export default function DemoApp() {
         lastRunRef.current = clone(activeRecord.configSnapshot);
         lastRunFilesRef.current = clone(activeRecord.fileSnapshots);
         lastRunMemoriesRef.current = clone(activeRecord.memorySnapshots);
+        lastRunContinuationRef.current = clone(activeRecord.continuationSnapshot || null);
+        lastRunConversationIdRef.current = activeRecord.conversationId;
       }
       // Keep serverSnapshot on the raw wire form when normalize changed data, so
       // auto-save can push the applied state; UI still treats local as ready.
@@ -2293,16 +2373,28 @@ export default function DemoApp() {
       : record));
   }
 
-  function newRecord(snapshot: AppConfig, fileSnapshots: Record<AgentRole, AgentFileRecord[]>, memorySnapshots: Record<AgentRole, unknown | null>): SimulationRecord {
+  function newRecord(
+    snapshot: AppConfig,
+    fileSnapshots: Record<AgentRole, AgentFileRecord[]>,
+    memorySnapshots: Record<AgentRole, unknown | null>,
+    continuation: RelationshipContinuationSnapshot | null = null,
+    replayOfConversationId: string | null = null,
+  ): SimulationRecord {
     const investorContext = asWorkingContext(memorySnapshots.investor);
     const founderContext = asWorkingContext(memorySnapshots.founder);
     return {
-      conversationId: id("conv"), createdAt: new Date().toISOString(), completedAt: null,
+      conversationId: id("conv"),
+      relationshipId: continuation?.relationshipId || null,
+      parentConversationId: continuation?.previousConversationId || null,
+      episodeNumber: continuation?.episodeNumber || 1,
+      continuationSnapshot: clone(continuation),
+      replayOfConversationId,
+      createdAt: new Date().toISOString(), completedAt: null,
       configVersion: activeVersion, configSnapshot: clone(snapshot),
       agentCardSnapshots: { investor: buildAgentCard(snapshot.investor), founder: buildAgentCard(snapshot.founder) },
       promptSnapshots: {
-        investor: composePrompt(snapshot.investor, snapshot.settings, investorContext),
-        founder: composePrompt(snapshot.founder, snapshot.settings, founderContext),
+        investor: composePrompt(snapshot.investor, snapshot.settings, investorContext, continuation),
+        founder: composePrompt(snapshot.founder, snapshot.settings, founderContext, continuation),
       },
       fileSnapshots: clone(fileSnapshots),
       memorySnapshots: clone(memorySnapshots),
@@ -2336,7 +2428,7 @@ export default function DemoApp() {
     record: SimulationRecord; type: DebugCall["type"]; actor: DebugCall["actor"]; round: number | null;
     systemPrompt: string; layerStates?: Record<string, boolean>; profile?: Record<string, string> | null;
     messages: Array<{ role: "system" | "user" | "assistant"; content: string }>; maxTokens: number; snapshot: AppConfig;
-    agentRole?: AgentRole; fileIds?: string[]; toolsEnabled?: boolean; recordProgress?: "replace" | "merge-debug" | "none"; publishDebug?: boolean;
+    agentRole?: AgentRole; fileIds?: string[]; toolsEnabled?: boolean; memoryToolsEnabled?: boolean; recordProgress?: "replace" | "merge-debug" | "none"; publishDebug?: boolean;
   }) {
     const started = nowMs();
     const startedAt = new Date().toISOString();
@@ -2356,10 +2448,13 @@ export default function DemoApp() {
       profileId: params.agentRole ? params.snapshot[params.agentRole].id : undefined,
       fileIds: params.fileIds,
       toolsEnabled: params.toolsEnabled,
+      memoryToolsEnabled: params.memoryToolsEnabled,
     };
+    const modelHeaders = new Headers({ "Content-Type": "application/json" });
+    if (params.memoryToolsEnabled && memoryScopeId) modelHeaders.set("x-agent-memory-scope", memoryScopeId);
     try {
       let response = await fetch("/api/model", {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: modelHeaders,
         body: JSON.stringify(requestBody), signal: abortRef.current.signal,
       });
       let data = await response.json().catch(() => ({}));
@@ -2367,11 +2462,12 @@ export default function DemoApp() {
       if ((!response.ok && String(data.error || "").includes("空内容"))
         || (response.ok && typeof data.content === "string" && !data.content.trim())) {
         response = await fetch("/api/model", {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST", headers: modelHeaders,
           body: JSON.stringify({
             ...requestBody,
             maxTokens: Math.max(4096, requestBody.maxTokens),
             toolsEnabled: false,
+            memoryToolsEnabled: false,
             messages: [
               ...params.messages,
               { role: "user" as const, content: "请直接输出合法且非空的 JSON 对象，不要调用工具，不要输出解释。" },
@@ -2434,7 +2530,7 @@ export default function DemoApp() {
     }
   }
 
-  async function postprocess(record: SimulationRecord, snapshot: AppConfig) {
+  async function postprocess(record: SimulationRecord, snapshot: AppConfig, persistMemoryChanges = true) {
     if (stopRef.current && record.messages.length === 0) return;
     setStatus("postprocessing");
     setRunningRole(null);
@@ -2472,8 +2568,9 @@ export default function DemoApp() {
           messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
           maxTokens: Math.max(4096, snapshot.settings.maxTokens), snapshot,
           agentRole: isPublic ? undefined : role,
-          // 会后提取只需对话与资料，启用文件工具容易空回复或误检索。
+          // 会后维护不开放文件工具，但允许按需查询当前 Agent 的归档/最新记忆。
           toolsEnabled: false,
+          memoryToolsEnabled: !isPublic,
         });
         const result = await parseWithRepair(response.raw, type, record, snapshot);
         record.results[kind] = result;
@@ -2482,7 +2579,7 @@ export default function DemoApp() {
           if (config.investor.id === snapshot.investor.id) setInvestorMemory(result);
           updateProfileById("investor", snapshot.investor.id, { memory: clone(result) });
           try {
-            await persistExtractedMemories("investor", result, record.conversationId, snapshot.founder.id);
+            if (persistMemoryChanges) await persistExtractedMemories("investor", result, record.conversationId, snapshot.founder.id);
           } catch (persistError: unknown) {
             const error = `投资人记忆写入失败：${persistError instanceof Error ? persistError.message : String(persistError)}`;
             record.errors.push(error);
@@ -2493,7 +2590,7 @@ export default function DemoApp() {
           if (config.founder.id === snapshot.founder.id) setFounderMemory(result);
           updateProfileById("founder", snapshot.founder.id, { memory: clone(result) });
           try {
-            await persistExtractedMemories("founder", result, record.conversationId, snapshot.investor.id);
+            if (persistMemoryChanges) await persistExtractedMemories("founder", result, record.conversationId, snapshot.investor.id);
           } catch (persistError: unknown) {
             const error = `创业者记忆写入失败：${persistError instanceof Error ? persistError.message : String(persistError)}`;
             record.errors.push(error);
@@ -2513,21 +2610,44 @@ export default function DemoApp() {
     }
 
     async function persistExtractedMemories(role: AgentRole, result: unknown, conversationId: string, counterpartyId: string) {
-      const drafts = normalizeExtractedMemories(result);
-      for (const [index, draft] of drafts.entries()) {
-        await agentStateRequest("/api/memories", {
-          method: "POST",
-          body: JSON.stringify({
-            agentId: snapshot[role].id,
+      const resultRecord = asRecord(result);
+      let actions = normalizeAgentActions(resultRecord.actions)
+        .filter((action) => action.type.startsWith("memory."))
+        .slice(0, 12)
+        .map((action) => ({
+          ...action,
+          input: {
+            ...action.input,
+            ...(action.type === "memory.create" ? { counterpartyId } : {}),
+            metadata: { ...asRecord(action.input.metadata), conversationId },
+          },
+        }));
+      // 兼容已保存的旧版记忆提示词及常见模型输出形状。
+      if (!actions.length) {
+        actions = normalizeExtractedMemories(result).map((draft, index) => ({
+          id: `simulation-memory-${index + 1}`,
+          type: "memory.create" as const,
+          reason: "从本次 Agent 对话提取增量长期记忆",
+          input: {
             kind: draft.kind,
             title: draft.title,
             content: draft.content,
             verification: draft.verification,
             priority: draft.priority,
             counterpartyId,
-            sourceType: "simulation",
-            sourceId: `${conversationId}:${role}:${index}`,
             metadata: { conversationId, sourceTurns: draft.sourceTurns },
+          },
+        }));
+      }
+      if (actions.length) {
+        await agentStateRequest("/api/agent-actions", {
+          method: "POST",
+          body: JSON.stringify({
+            agentId: snapshot[role].id,
+            actions,
+            sourceType: "simulation",
+            sourceId: `${conversationId}:${role}`,
+            counterpartyId,
           }),
         });
       }
@@ -2541,13 +2661,21 @@ export default function DemoApp() {
     }
   }
 
-  async function runSimulation(snapshot: AppConfig, filesSnapshot: Record<AgentRole, AgentFileRecord[]>, memorySnapshots: Record<AgentRole, unknown | null>) {
-    const record = newRecord(snapshot, filesSnapshot, memorySnapshots);
+  async function runSimulation(
+    snapshot: AppConfig,
+    filesSnapshot: Record<AgentRole, AgentFileRecord[]>,
+    memorySnapshots: Record<AgentRole, unknown | null>,
+    continuation: RelationshipContinuationSnapshot | null = null,
+    replayOfConversationId: string | null = null,
+  ) {
+    const record = newRecord(snapshot, filesSnapshot, memorySnapshots, continuation, replayOfConversationId);
     setActiveRecordId(record.conversationId);
     saveRecordProgress(record);
     lastRunRef.current = snapshot;
     lastRunFilesRef.current = clone(filesSnapshot);
     lastRunMemoriesRef.current = clone(memorySnapshots);
+    lastRunContinuationRef.current = clone(continuation);
+    lastRunConversationIdRef.current = record.conversationId;
     stopRef.current = false;
     pauseRef.current = false;
     setMessages([]); setDebugCalls([]); setPublicResult(null); setRawErrors({}); setErrors([]); setTab("conversation");
@@ -2632,9 +2760,32 @@ export default function DemoApp() {
       }
       if (stopRef.current) record.endReason = "manual_stop";
       else if (!record.endReason) record.endReason = "max_rounds";
-      await postprocess(record, snapshot);
+      await postprocess(record, snapshot, !replayOfConversationId);
     } finally {
       record.completedAt = new Date().toISOString();
+      if (!replayOfConversationId && continuation?.relationshipId && record.messages.length) {
+        try {
+          const relationshipData = await agentStateRequest("/api/relationships", {
+            method: "POST",
+            body: JSON.stringify({
+              action: "complete",
+              investorAgentId: snapshot.investor.id,
+              founderAgentId: snapshot.founder.id,
+              conversationId: record.conversationId,
+              summary: buildRelationshipSummary(record),
+              recentTurns: relationshipRecentTurns(record),
+              completedAt: record.completedAt,
+            }),
+          });
+          const savedRelationship = relationshipData.relationship as AgentRelationship | undefined;
+          if (savedRelationship) {
+            record.episodeNumber = savedRelationship.episodeCount;
+            setActiveRelationship(clone(savedRelationship));
+          }
+        } catch (caught) {
+          record.errors.push(`连续对接状态保存失败：${caught instanceof Error ? caught.message : String(caught)}`);
+        }
+      }
       record.stats = record.messages.reduce((sum, message) => ({ inputTokens: sum.inputTokens + message.inputTokens, outputTokens: sum.outputTokens + message.outputTokens, estimatedCost: sum.estimatedCost + message.estimatedCost }), { inputTokens: 0, outputTokens: 0, estimatedCost: 0 });
       setRecords((current) => [clone(record), ...current.filter((item) => item.conversationId !== record.conversationId)].slice(0, 20));
       setDebugCalls([...record.debugCalls]);
@@ -2895,6 +3046,7 @@ export default function DemoApp() {
         agentRole: role,
         fileIds: thread.fileSnapshots.filter((file) => file.status === "ready").map((file) => file.id),
         toolsEnabled: thread.agentSnapshot.prompts.tools.enabled,
+        memoryToolsEnabled: true,
         recordProgress: "none",
         publishDebug: false,
       });
@@ -2911,16 +3063,40 @@ export default function DemoApp() {
       if (directCall) directCall.parsedResult = resultRecord;
       const toolCalls = clone(directCall?.toolCalls || []);
       const proposedActions = normalizeAgentActions(resultRecord.actions);
+      const assistantMessageId = id("direct-agent");
+      let actionStatus: DirectChatMessage["actionStatus"] = proposedActions.length ? "pending" : undefined;
+      let actionError: string | null = null;
+      let actionsAppliedAt: string | null = null;
+      if (proposedActions.length) {
+        try {
+          await agentStateRequest("/api/agent-actions", {
+            method: "POST",
+            body: JSON.stringify({
+              agentId: thread.agentSnapshot.id,
+              actions: proposedActions,
+              sourceType: "direct_chat",
+              sourceId: `${threadId}:${assistantMessageId}`,
+            }),
+          });
+          actionStatus = "applied";
+          actionsAppliedAt = new Date().toISOString();
+          await refreshAgentState(role, thread.agentSnapshot.id);
+        } catch (caught) {
+          actionStatus = "failed";
+          actionError = caught instanceof Error ? caught.message : String(caught);
+          setDirectChatErrors((current) => ({ ...current, [role]: `Agent 记忆自动更新失败：${actionError}` }));
+        }
+      }
       const assistantMessage: DirectChatMessage = {
-        id: id("direct-agent"), role: "assistant", content: String(resultRecord.message).trim(), createdAt: new Date().toISOString(),
+        id: assistantMessageId, role: "assistant", content: String(resultRecord.message).trim(), createdAt: new Date().toISOString(),
         callId: directCall?.id || null, inputTokens: response.inputTokens, outputTokens: response.outputTokens,
         usageEstimated: response.usageEstimated,
         estimatedCost: response.inputTokens / 1_000_000 * thread.settingsSnapshot.inputPricePerMillion + response.outputTokens / 1_000_000 * thread.settingsSnapshot.outputPricePerMillion,
         toolCalls,
         proposedActions,
-        actionStatus: proposedActions.length ? "pending" : undefined,
-        actionError: null,
-        actionsAppliedAt: null,
+        actionStatus,
+        actionError,
+        actionsAppliedAt,
         workingContextSnapshot: clone(workingContext),
       };
       setDirectChats((current) => ({ ...current, [role]: { ...current[role], threads: current[role].threads.map((item) => item.id === threadId
@@ -2975,16 +3151,7 @@ export default function DemoApp() {
     }
   }
 
-  function rejectDirectChatActions(role: AgentRole, threadId: string, messageId: string) {
-    setDirectChats((current) => ({ ...current, [role]: { ...current[role], threads: current[role].threads.map((thread) => thread.id === threadId
-      ? { ...thread, messages: thread.messages.map((message) => message.id === messageId
-        ? { ...message, actionStatus: "rejected" as const, actionError: null }
-        : message) }
-      : thread) } }));
-    setToast("已保留对话，但没有执行 Agent 提议的行动");
-  }
-
-  async function start() {
+  async function start(includeHistory = true) {
     if (dailyBusy || directChatBusy || ["running", "paused", "postprocessing"].includes(status)) {
       setToast("请等待当前模型任务结束后再开始模拟");
       return;
@@ -3002,12 +3169,24 @@ export default function DemoApp() {
       return;
     }
     try {
-      setToast("正在冻结双方最新 Memory 与任务快照…");
-      const [investorContext, founderContext] = await Promise.all([
+      setToast(includeHistory ? "正在读取双方最新 Memory 与历史对接…" : "正在冻结双方最新 Memory，将以新话题开始…");
+      const [investorContext, founderContext, relationshipData] = await Promise.all([
         loadWorkingContext(config.investor.id, config.founder.id),
         loadWorkingContext(config.founder.id, config.investor.id),
+        agentStateRequest("/api/relationships", {
+          method: "POST",
+          body: JSON.stringify({
+            action: "ensure",
+            investorAgentId: config.investor.id,
+            founderAgentId: config.founder.id,
+          }),
+        }),
       ]);
-      await runSimulation(clone(config), currentProfileFileSnapshots(), { investor: investorContext, founder: founderContext });
+      const relationship = relationshipData.relationship as AgentRelationship | undefined;
+      if (!relationship) throw new Error("服务端没有返回有效的 Agent 对接关系。");
+      setActiveRelationship(clone(relationship));
+      const continuation = continuationFromRelationship(relationship, includeHistory);
+      await runSimulation(clone(config), currentProfileFileSnapshots(), { investor: investorContext, founder: founderContext }, continuation);
     } catch (caught) {
       setToast(`开始模拟失败：${caught instanceof Error ? caught.message : String(caught)}`);
     }
@@ -3018,7 +3197,13 @@ export default function DemoApp() {
     if (!workspacePersisted) { setToast("请等待当前工作区保存到服务器后再重新生成"); return; }
     if (Object.values(profileDirtyRef.current).some(Boolean)) { setToast("请先保存或撤销双方资料草稿，再重新生成"); return; }
     if (!lastRunRef.current || !lastRunFilesRef.current || !lastRunMemoriesRef.current) { setToast("没有可重新生成的完整快照"); return; }
-    runSimulation(clone(lastRunRef.current), clone(lastRunFilesRef.current), clone(lastRunMemoriesRef.current));
+    runSimulation(
+      clone(lastRunRef.current),
+      clone(lastRunFilesRef.current),
+      clone(lastRunMemoriesRef.current),
+      clone(lastRunContinuationRef.current),
+      lastRunConversationIdRef.current,
+    );
   }
 
   function stop() {
@@ -3075,6 +3260,8 @@ export default function DemoApp() {
     lastRunRef.current = clone(record.configSnapshot);
     lastRunFilesRef.current = clone(record.fileSnapshots);
     lastRunMemoriesRef.current = clone(record.memorySnapshots);
+    lastRunContinuationRef.current = clone(record.continuationSnapshot || null);
+    lastRunConversationIdRef.current = record.conversationId;
     setActiveRecordId(record.conversationId); setErrors(clone(record.errors)); setStatus("completed"); setRecordsOpen(false); setTab("conversation");
   }
 
@@ -3159,6 +3346,11 @@ export default function DemoApp() {
   const statusLabel: Record<RunStatus, string> = { idle: "未运行", running: "运行中", paused: "已暂停", stopping: "正在停止", postprocessing: "结果生成中", completed: "已完成", error: "运行失败" };
   const actualEvaluatorCall = [...debugCalls].reverse().find((call) => call.type === "public_evaluation");
   const actualJsonRepairCall = [...debugCalls].reverse().find((call) => call.type === "json_repair");
+  const hasLocalRelationshipHistory = records.some((record) => record.configSnapshot.investor.id === config.investor.id
+    && record.configSnapshot.founder.id === config.founder.id && !record.replayOfConversationId && record.messages.length > 0);
+  const hasRelationshipHistory = Boolean(activeRelationship?.episodeCount
+    && activeRelationship.investorAgentId === config.investor.id
+    && activeRelationship.founderAgentId === config.founder.id) || hasLocalRelationshipHistory;
 
   return (
     <main className="app-shell">
@@ -3189,7 +3381,8 @@ export default function DemoApp() {
           <aside className="controls">
             <div className="control-title"><strong>本次运行设置</strong><span>编辑仅影响下一次模拟</span></div>
             <div className="run-buttons">
-              {!busy && <button className="primary" title={startBlockedReason || undefined} aria-disabled={Boolean(startBlockedReason)} onClick={start}>▶ 开始模拟</button>}
+              {!busy && <button className="primary" title={startBlockedReason || undefined} aria-disabled={Boolean(startBlockedReason)} onClick={() => void start(true)}>▶ {hasRelationshipHistory ? "继续模拟" : "开始模拟"}</button>}
+              {!busy && hasRelationshipHistory && <button title="保留双方长期 Memory，但不注入上一次摘要与最近发言" onClick={() => void start(false)}>＋ 开启新话题</button>}
               {status === "running" && <button onClick={() => { pauseRef.current = true; setStatus("paused"); }}>Ⅱ 暂停</button>}
               {status === "paused" && <button className="primary" onClick={() => { pauseRef.current = false; setStatus("running"); }}>▶ 继续</button>}
               {busy && <button className="danger" onClick={stop}>■ 停止</button>}
@@ -3197,7 +3390,7 @@ export default function DemoApp() {
               <button disabled={dailyBusy !== null || directChatBusy !== null || (busy && status !== "paused")} onClick={reset}>重置</button>
             </div>
             {startBlockedReason && <div className="run-block-reason">{startBlockedReason}</div>}
-            <div className="run-settings-note">对话规则会写入任务层传给双方 Agent；“结果 / 记忆”开关由平台在对话后调度执行。</div>
+            <div className="run-settings-note">同一对 Agent 默认续接上次摘要、最近发言与双方最新 Memory；每次运行仍保留独立快照。</div>
             <div className="control-grid">
               <label>最大对话轮数<input type="number" min={1} max={20} value={config.settings.maxRounds} disabled={busy} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, maxRounds: Number(event.target.value) } })} /></label>
               <label>先发言<select value={config.settings.firstSpeaker} disabled={busy} onChange={(event) => persistConfig({ ...config, settings: { ...config.settings, firstSpeaker: event.target.value as AgentRole } })}><option value="investor">投资人</option><option value="founder">创业者</option></select></label>
@@ -3331,7 +3524,6 @@ export default function DemoApp() {
           onPreviewChatCall={(call) => setPromptModal({ title: `${ROLE_LABEL[role]}用户测试对话 · 本次实际完整请求与工具轨迹`, content: `${formatModelRequest(call.messages)}\n\n【工具调用轨迹】\n${JSON.stringify(call.toolCalls || [], null, 2)}` })}
           onPreviewChatPrompt={(thread) => setPromptModal({ title: `${ROLE_LABEL[role]}用户测试对话 · 当前专用任务层与工作状态`, content: formatModelRequest([{ role: "system", content: composeDirectChatPrompt(thread.agentSnapshot, thread.settingsSnapshot, agentContexts[role], config.directChatTaskPrompts[role]) }]) })}
           onApplyChatActions={(threadId, messageId, actions) => applyDirectChatActions(role, threadId, messageId, actions)}
-          onRejectChatActions={(threadId, messageId) => rejectDirectChatActions(role, threadId, messageId)}
           profileOptions={profiles[role]}
           onSelectProfile={(profileId) => selectUserProfile(role, profileId)}
           onCreateProfile={() => createUserProfile(role)}
@@ -3345,7 +3537,7 @@ export default function DemoApp() {
 
       {versionOpen && <div className="modal-backdrop" onMouseDown={() => setVersionOpen(false)}><section className="modal list-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>SERVER VERSIONS</p><h2>配置版本</h2></div><button onClick={() => setVersionOpen(false)}>×</button></div><button className="primary" onClick={saveVersion}>＋ 保存当前配置</button><div className="saved-list">{versions.length ? versions.map((version) => <article key={version.id}><div><strong>{version.name}</strong><span>{new Date(version.createdAt).toLocaleString("zh-CN")}</span></div><div><button onClick={() => loadVersion(version)}>加载</button><button onClick={() => downloadJson(`${version.name}.json`, version.config)}>导出</button><button className="danger-text" onClick={() => setVersions((current) => current.filter((item) => item.id !== version.id))}>删除</button></div></article>) : <div className="empty-panel">还没有保存版本</div>}</div></section></div>}
 
-      {recordsOpen && <div className="modal-backdrop" onMouseDown={() => setRecordsOpen(false)}><section className="modal records-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>LOCAL RUN HISTORY</p><h2>最近模拟记录</h2></div><button onClick={() => setRecordsOpen(false)}>×</button></div><div className="saved-list">{records.length ? records.map((record) => <article key={record.conversationId}><div><strong>{record.configSnapshot.investor.fields.agentName} × {record.configSnapshot.founder.fields.agentName}</strong><span>{new Date(record.createdAt).toLocaleString("zh-CN")} · {record.messages.length} 条消息 · {record.endReason}</span><code>{record.conversationId}</code></div><div><button onClick={() => loadRecord(record)}>查看</button><button onClick={() => downloadJson(`${record.conversationId}.json`, record)}>导出</button></div></article>) : <div className="empty-panel">还没有模拟记录</div>}</div></section></div>}
+      {recordsOpen && <div className="modal-backdrop" onMouseDown={() => setRecordsOpen(false)}><section className="modal records-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>LOCAL RUN HISTORY</p><h2>最近模拟记录</h2></div><button onClick={() => setRecordsOpen(false)}>×</button></div><div className="saved-list">{records.length ? records.map((record) => <article key={record.conversationId}><div><strong>{record.configSnapshot.investor.fields.agentName} × {record.configSnapshot.founder.fields.agentName}</strong><span>{new Date(record.createdAt).toLocaleString("zh-CN")} · {record.replayOfConversationId ? "原快照重跑" : `第 ${record.episodeNumber || 1} 次对接`} · {record.messages.length} 条消息 · {record.endReason}</span><code>{record.conversationId}</code></div><div><button onClick={() => loadRecord(record)}>查看</button><button onClick={() => downloadJson(`${record.conversationId}.json`, record)}>导出</button></div></article>) : <div className="empty-panel">还没有模拟记录</div>}</div></section></div>}
 
       {debugDrawer && <><div className="drawer-backdrop" onClick={() => setDebugDrawer(false)} /><aside className="debug-drawer"><div className="modal-head"><div><p>MODEL CALL INSPECTOR</p><h2>调试抽屉</h2></div><button onClick={() => setDebugDrawer(false)}>×</button></div><DebugList calls={allDebugCalls} /></aside></>}
       {toast && <div className="toast">{toast}</div>}

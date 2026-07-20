@@ -72,6 +72,61 @@ test("memory CRUD, idempotency and working-context projection", () => {
   assert.equal(archived.status, "archived");
   assert.equal(store.listMemories(scopeId, agentId).length, 0);
   assert.equal(store.listMemories(scopeId, agentId, { status: "all" }).length, 1);
+
+  const restored = store.commitAgentActions(scopeId, agentId, "investor", [{
+    id: "restore-memory",
+    type: "memory.restore",
+    reason: "用户要求恢复",
+    memoryId: archived.id,
+    input: { expectedVersion: archived.version },
+  }], "direct_chat", "restore-turn").memories[0];
+  assert.equal(restored?.status, "active");
+});
+
+test("simulation memory actions stay unverified and cannot overwrite confirmed memory", () => {
+  const scopeId = "test-scope-autonomous";
+  const agentId = "investor-demo-001";
+  const created = store.commitAgentActions(scopeId, agentId, "investor", [{
+    id: "simulation-create",
+    type: "memory.create",
+    reason: "对方在模拟对话中自报",
+    input: { kind: "fact", title: "项目阶段", content: "处于 Pre-A", verification: "confirmed" },
+  }], "simulation", "simulation-1").memories[0];
+  assert.equal(created?.verification, "unverified");
+
+  const confirmed = store.createMemory(scopeId, agentId, "investor", {
+    kind: "decision",
+    title: "用户决策",
+    content: "暂不跟进",
+    verification: "confirmed",
+  });
+  assert.throws(() => store.commitAgentActions(scopeId, agentId, "investor", [{
+    id: "simulation-overwrite",
+    type: "memory.update",
+    reason: "模拟对话推断",
+    memoryId: confirmed.id,
+    input: { content: "立即跟进", expectedVersion: confirmed.version },
+  }], "simulation", "simulation-2"), /不能自动改写/);
+});
+
+test("legacy browser memory scope migrates once into the stable workspace scope", () => {
+  const legacyScope = "browser-legacy-memory-scope";
+  const stableScope = "workspace-default-v1";
+  const agentId = "founder-demo-001";
+  const legacy = store.createMemory(legacyScope, agentId, "founder", {
+    kind: "preference",
+    title: "沟通偏好",
+    content: "优先异步沟通",
+    verification: "confirmed",
+    sourceType: "direct_chat",
+    sourceId: "legacy-scope-turn",
+  });
+
+  store.migrateMemoryScope(legacyScope, stableScope);
+  store.migrateMemoryScope(legacyScope, stableScope);
+
+  assert.equal(store.listMemories(legacyScope, agentId, { status: "all" }).length, 0);
+  assert.equal(store.listMemories(stableScope, agentId, { status: "all" })[0]?.id, legacy.id);
 });
 
 test("confirmed action batches roll back atomically", () => {

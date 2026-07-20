@@ -52,6 +52,7 @@ export type AgentActionType =
   | "memory.create"
   | "memory.update"
   | "memory.archive"
+  | "memory.restore"
   | "task.create"
   | "task.update"
   | "task.cancel";
@@ -258,7 +259,7 @@ export interface FileSearchResult {
   score: number;
 }
 
-export interface ToolExecutionTrace {
+export interface PrivateFileToolExecutionTrace {
   tool: "search_private_files";
   agentRole: AgentRole;
   query: string;
@@ -267,6 +268,21 @@ export interface ToolExecutionTrace {
   results: FileSearchResult[];
   error: string | null;
 }
+
+export interface MemorySearchToolExecutionTrace {
+  tool: "search_agent_memory";
+  agentRole: AgentRole;
+  query: string;
+  topK: number;
+  includeArchived: boolean;
+  durationMs: number;
+  results: Array<Pick<AgentMemoryItem,
+    "id" | "kind" | "title" | "content" | "verification" | "status" | "priority" | "counterpartyId" | "version" | "updatedAt"
+  >>;
+  error: string | null;
+}
+
+export type ToolExecutionTrace = PrivateFileToolExecutionTrace | MemorySearchToolExecutionTrace;
 
 export interface DirectChatMessage {
   id: string;
@@ -279,7 +295,7 @@ export interface DirectChatMessage {
   usageEstimated: boolean;
   estimatedCost: number;
   toolCalls: ToolExecutionTrace[];
-  /** Agent 提议的记忆或任务变更；必须由用户确认后才执行。 */
+  /** Agent 自主选择的记忆或任务变更；新版会在回复成功后自动执行。 */
   proposedActions?: AgentActionProposal[];
   actionStatus?: "pending" | "applied" | "rejected" | "failed";
   actionError?: string | null;
@@ -311,8 +327,44 @@ export interface DirectChatRoleState {
 
 export type DirectChatState = Record<AgentRole, DirectChatRoleState>;
 
+export interface RelationshipRecentTurn {
+  role: AgentRole;
+  agentName: string;
+  round: number;
+  content: string;
+  createdAt: string;
+}
+
+export interface AgentRelationship {
+  id: string;
+  investorAgentId: string;
+  founderAgentId: string;
+  episodeCount: number;
+  lastConversationId: string | null;
+  summary: string;
+  recentTurns: RelationshipRecentTurn[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RelationshipContinuationSnapshot {
+  relationshipId: string;
+  episodeNumber: number;
+  previousConversationId: string | null;
+  summary: string;
+  recentTurns: RelationshipRecentTurn[];
+  relationshipVersion: number;
+}
+
 export interface SimulationRecord {
   conversationId: string;
+  /** 旧记录可能没有连续对接字段。 */
+  relationshipId?: string | null;
+  parentConversationId?: string | null;
+  episodeNumber?: number;
+  continuationSnapshot?: RelationshipContinuationSnapshot | null;
+  replayOfConversationId?: string | null;
   createdAt: string;
   completedAt: string | null;
   configVersion: string | null;

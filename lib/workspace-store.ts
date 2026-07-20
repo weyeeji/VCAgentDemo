@@ -257,13 +257,26 @@ function isAgentFileRecord(value: unknown, expectedRole?: "investor" | "founder"
 }
 
 function isToolExecutionTrace(value: unknown): value is ToolExecutionTrace {
-  if (!isObject(value) || value.tool !== "search_private_files" || !isAgentRole(value.agentRole)
+  if (!isObject(value) || !isAgentRole(value.agentRole)
     || typeof value.query !== "string" || !isFiniteNonNegative(value.topK) || !isFiniteNonNegative(value.durationMs)
     || !Array.isArray(value.results) || (value.error !== null && typeof value.error !== "string")) return false;
-  return value.results.every((result) => isObject(result) && isShortString(result.fileId)
-    && isShortString(result.fileName, 2_000) && isShortString(result.chunkId)
-    && typeof result.location === "string" && typeof result.content === "string"
-    && typeof result.score === "number" && Number.isFinite(result.score));
+  if (value.tool === "search_private_files") {
+    return value.results.every((result) => isObject(result) && isShortString(result.fileId)
+      && isShortString(result.fileName, 2_000) && isShortString(result.chunkId)
+      && typeof result.location === "string" && typeof result.content === "string"
+      && typeof result.score === "number" && Number.isFinite(result.score));
+  }
+  if (value.tool === "search_agent_memory" && typeof value.includeArchived === "boolean") {
+    return value.results.every((result) => isObject(result) && isNonEmptyShortString(result.id)
+      && typeof result.title === "string" && typeof result.content === "string"
+      && ["fact", "preference", "decision", "constraint", "note"].includes(String(result.kind))
+      && ["confirmed", "unverified", "conflicted"].includes(String(result.verification))
+      && ["active", "superseded", "archived", "deleted"].includes(String(result.status))
+      && isFiniteNonNegative(result.priority) && isNullableId(result.counterpartyId)
+      && Number.isInteger(result.version) && Number(result.version) >= 1
+      && typeof result.updatedAt === "string");
+  }
+  return false;
 }
 
 const DEBUG_CALL_TYPES = new Set([
@@ -314,7 +327,7 @@ function isDirectChatMessage(value: unknown): value is DirectChatMessage {
     && Array.isArray(value.toolCalls) && value.toolCalls.every(isToolExecutionTrace)
     && (value.proposedActions === undefined || (Array.isArray(value.proposedActions) && value.proposedActions.length <= 20
       && value.proposedActions.every((action) => isObject(action) && isNonEmptyShortString(action.id)
-        && ["memory.create", "memory.update", "memory.archive", "task.create", "task.update", "task.cancel"].includes(String(action.type))
+        && ["memory.create", "memory.update", "memory.archive", "memory.restore", "task.create", "task.update", "task.cancel"].includes(String(action.type))
         && typeof action.reason === "string" && isObject(action.input)
         && (action.memoryId === undefined || isNonEmptyShortString(action.memoryId))
         && (action.taskId === undefined || isNonEmptyShortString(action.taskId)))))

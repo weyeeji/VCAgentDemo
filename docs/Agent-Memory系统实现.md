@@ -1,38 +1,66 @@
-# Agent Memory 系统实现
+# Agent Memory 与连续对接系统
 
-## 1. 实现目标
+## 1. 目标
 
-本次改造把原来“每个资料保存一块 JSON”的记忆，升级为每个 Agent 独立的结构化工作状态。现在可以：
+系统把 Agent 状态分为三层：
 
-- 按 Agent 增、查、改、归档和恢复 Memory。
-- 按 Agent 创建和维护任务，支持待办、进行中、阻塞、完成和取消状态。
-- 用户在与自己的 Agent 对话时，让 Agent 提出 Memory / 任务变更；用户确认后才原子执行。
-- 下一次用户对话、日报或模拟自动读取最新的已确认决策、任务和相关记忆。
-- 每次模拟仍保留快照语义：运行中不会被后来的记忆修改。
+- Agent 全局记忆：对该 Agent 的所有工作场景生效。
+- 对手方记忆：通过 `counterparty_id` 只对当前投资人/创业者关系生效。
+- 连续对接上下文：同一对 Agent 的累计摘要、最近发言和 episode 链路。
 
-完整实现为本项目内置的轻量系统，没有引入 Mem0。原因是这个 Demo 的核心不是大规模语义召回，而是“用户确认的决策如何可控地进入任务层”。自建版本更容易演示确认门、快照、任务状态、冲突检测和完整调试链路。
+用户与自己的 Agent 对话，以及 Agent 与 Agent 的模拟，都会维护同一套结构化 Memory。Agent 可以自主查询、新增、修改、归档和恢复记忆，不需要用户逐项审批；所有写入仍由平台校验并记录审计事件。
 
-## 2. 用户可见功能
+## 2. 连续对接
 
-### 2.1 Memory 与任务面板
+同一投资人 Agent 与创业者 Agent 对应一条稳定的 `relationshipId`。每次点击模拟仍创建新的 `conversationId`，因此运行快照、调试记录和结果互不覆盖，但新 episode 会读取：
 
-每个 Agent 配置区新增“Memory 与任务状态”模块：
+- 双方最新的全局记忆；
+- 双方针对当前对方的记忆；
+- 上一次累计关系摘要；
+- 最近 12 条双方公开发言。
 
-- Memory 可按关键字搜索，可切换是否显示已归档项。
-- Memory 类型包括 `fact`、`preference`、`decision`、`constraint`、`note`。
-- 核实状态包括 `confirmed`、`unverified`、`conflicted`。
-- 可新增、编辑、确认、归档或恢复 Memory。
-- 任务可新增、开始、完成、取消或重新打开。
+界面在已有历史时默认显示“继续模拟”。“开启新话题”仍保留双方长期 Memory，但本次不注入上一次摘要和最近发言。“按原快照重新生成”使用原来的配置、文件、Memory 和连续对接快照，不写回 Memory，也不增加关系 episode。
 
-删除采用软删除/归档，不会直接物理清除记录。这样既满足 Demo 中的“删”，又能保留可追溯性。
+关系存储包含两张表：
 
-### 2.2 用户指挥 Agent
+- `agent_relationships`：当前累计状态、episode 数量、最后一次会话和版本。
+- `agent_relationship_episodes`：每次完成的会话 ID、序号、摘要、最近发言和完成时间。
 
-用户直聊的模型输出现在除了 `message` 和 `control`，还可包含 `actions`：
+完成写入以 `conversation_id` 幂等，同一会话重试不会重复增加 episode。
+
+## 3. Memory 与任务数据
+
+### `agent_memories`
+
+关键字段：
+
+- `scope_id + agent_id`：基本隔离边界。
+- `kind`：`fact / preference / decision / constraint / note`。
+- `verification`：`confirmed / unverified / conflicted`。
+- `status`：`active / superseded / archived / deleted`。
+- `counterparty_id`：为空表示全局记忆，否则只属于指定对接对象。
+- `source_type + source_id`：来源和幂等键。
+- `version`：更新、归档和恢复使用的乐观锁版本。
+
+### `agent_tasks`
+
+任务支持待办、进行中、阻塞、完成和取消，也可绑定对手方或来源 Memory。Working Context 只注入活动任务。
+
+### 审计与批次
+
+- `agent_state_events` 保存每次变更的前后值、来源和时间。
+- `agent_action_batches` 保存成功提交的行动批次；相同来源重试直接返回第一次结果。
+- 删除采用归档，Agent 和用户都可恢复，不做不可逆物理删除。
+
+## 4. 用户与自己 Agent 的对话
+
+每次发送消息前，系统重新读取该 Agent 最新 Working Context。模型还可以调用只读的 `search_agent_memory` 工具，按关键词查询当前 Agent 的活动或归档记忆，并获得操作所需的 ID 与版本。
+
+回复 JSON 可以包含：
 
 ```json
 {
-  "message": "好的，我建议把这项决策记下来，并创建一个跟进任务。",
+  "message": "明白，我已经更新了投资偏好。",
   "control": {
     "suggest_end": false,
     "end_reason": null,
@@ -40,164 +68,90 @@
   },
   "actions": [
     {
-      "id": "remember-demo-decision",
-      "type": "memory.create",
-      "reason": "用户明确表示本周安排 Demo",
+      "id": "update-stage-preference",
+      "type": "memory.update",
+      "reason": "用户明确调整投资阶段",
+      "memoryId": "memory_xxx",
       "input": {
-        "kind": "decision",
-        "title": "本周安排产品 Demo",
-        "content": "在本周五前安排一次产品 Demo",
-        "priority": 90
-      }
-    },
-    {
-      "id": "create-demo-task",
-      "type": "task.create",
-      "reason": "需要可执行的下一步",
-      "input": {
-        "title": "确认产品 Demo 时间",
-        "description": "联系对方确认本周五前的具体时间",
-        "priority": 80
+        "content": "重点关注 Pre-A 至 A 轮",
+        "expectedVersion": 2
       }
     }
   ]
 }
 ```
 
-界面会展示变更类型、理由和输入，用户可选择“确认执行”或“不执行”。未确认的提议不会写库；一批行动中任何一个失败时，整批回滚。执行失败后可重试。
+回复成功解析后，平台自动原子执行 `actions`。界面展示操作类型、理由、结果和失败信息，不再要求用户确认。失败批次可以幂等重试。
 
-这是“给 Agent 工具”的可控实现：Agent 获得的是结构化行动协议，而不是直接写 SQLite 的权限。目前没有把写操作做成模型可直接调用的 function tool，因为用户确认是必要的产品语义。以后可以把同一批 API 包装成只读查询工具和需审批的写入工具。
+直聊产生的 Memory 规则：
 
-## 3. 运行链路
+- 用户明确表达的事实、偏好、约束和决策可写为 `confirmed`。
+- 文件内容、引用文字、历史记忆或 Agent 自己的推断不能自动升级为用户确认指令。
+- Agent 只能操作当前 Agent 作用域，不能通过参数切换到另一个 Agent。
 
-```mermaid
-flowchart LR
-    U["用户与自己的 Agent 对话"] --> C["读取最新 Working Context"]
-    C --> M["Agent 回复 + actions 提案"]
-    M --> H{"用户确认？"}
-    H -- "否" --> N["仅保留对话"]
-    H -- "是" --> T["事务中批量写入 Memory / Task"]
-    T --> V["生成新的状态版本"]
-    V --> D["下次直聊 / 日报读最新状态"]
-    V --> S["下次模拟开始时冻结快照"]
-    S --> P["对话结束后提取增量未核实记忆"]
-    P --> V
-```
+## 5. 双 Agent 模拟后的记忆维护
 
-不同入口对状态时效性的处理如下：
+模拟开始时冻结双方 Working Context，运行过程中不修改该快照。对话结束后，双方分别执行一次记忆维护，输出最多 12 个 `memory.create / memory.update / memory.archive / memory.restore` 操作。
 
-| 入口 | 记忆读取时机 | 目的 |
-| --- | --- | --- |
-| 用户直聊 | 每次发送消息前重新读取 | 上一轮刚确认的决策在下一轮立即生效 |
-| 日报 | 每次生成前读取 | 使日报反映当前最新任务和决策 |
-| 双 Agent 模拟 | 点击开始时读取并冻结 | 保证对话可重现，运行中不漂移 |
-| 会后记忆提取 | 使用本次运行冻结状态作为去重参考 | 只输出本轮增量，不覆盖整份记忆 |
-| 按原快照重跑 | 使用原记忆/任务快照 | 完全保持原运行条件 |
+模拟写入受到额外限制：
 
-## 4. 数据模型与隔离
+- 新记忆强制为 `unverified`，冲突可保留为 `conflicted`。
+- 不能修改、归档或恢复 `confirmed` 记忆。
+- 只能维护当前对接对象的关系记忆，不能影响其他对手方或全局记忆。
+- 创建操作由服务端强制绑定当前 `counterparty_id`。
+- 整批操作原子执行，版本冲突时不会静默覆盖。
 
-存储层使用项目已有的 SQLite 数据文件，新增四张表：
+旧版 `{"memories": [...]}` 提取结果仍可兼容，会被转换成 `memory.create` 行动。
 
-### `agent_memories`
+## 6. Working Context
 
-关键字段：
+服务端把 Memory 和任务编译为 `WorkingContextSnapshot`：
 
-- `scope_id + agent_id`：记忆的基本隔离边界。
-- `kind`：事实、偏好、决策、约束或备注。
-- `verification`：已确认、未核实或存在冲突。
-- `status`：有效、已被替代、已归档或已删除。
-- `counterparty_id`：可选的对手方作用域；空值表示 Agent 全局记忆。
-- `source_type + source_id`：来源标识和幂等键，防止同一次模拟或对话重复写入。
-- `version`：乐观锁版本。
+- 已确认的 decision、preference、constraint 进入“已确认决策与偏好”。
+- 活动任务进入“当前任务”。
+- 未核实事实、冲突项和历史内容进入参考区。
+- 双 Agent 模拟只选择全局项和当前对手方项。
+- 内容带 ID、版本、优先级和核实状态，方便 Agent 自主维护。
+- 提示词投影上限为 18,000 字符，超出时优先保留高优先级内容。
 
-### `agent_tasks`
+连续对接摘要属于双方已经看过的公开对话历史；双方各自的私有 Memory 不会进入对方提示词。
 
-任务包含标题、说明、状态、优先级、截止时间、对手方、关联 Memory、来源和版本。工作上下文只注入 `todo`、`in_progress`、`blocked` 三种活动状态。
+## 7. 持久化作用域
 
-### `agent_state_events`
+旧版本使用浏览器生成的 `scope_id`。现在服务端将旧作用域一次性迁移到稳定的工作区作用域 `workspace-default-v1`，因此清理浏览器存储或换浏览器后仍可读取同一工作区的 Agent Memory 和连续对接状态。
 
-每次 Memory / 任务变更保存变更前、变更后、来源和时间。当前只实现了存储层审计，还没有审计日志查看页。
+当前产品仍是单一共享工作区，不是多租户系统。若支持多个账号或租户，应把稳定作用域替换为服务端认证得到的 `tenant_id + workspace_id`，不能继续使用固定值。
 
-### `agent_action_batches`
-
-保存已成功提交的直聊行动批次与返回结果。同一 `scope_id + agent_id + source_type + source_id` 被重试时直接返回首次结果，不会再次修改版本或重复创建数据。
-
-`scope_id` 由浏览器首次打开时生成，存在 `localStorage` 中，并通过 `x-agent-memory-scope` 请求头发送给服务端。它可以防止同一服务上不同浏览器 Demo 状态互相污染，但不是正式的用户/租户认证。清空浏览器存储后会生成新作用域；原数据仍在 SQLite 中，但当前 UI 不会自动恢复旧作用域。
-
-## 5. Working Context 投影
-
-服务端会把结构化数据编译成 `WorkingContextSnapshot`：
-
-- 已确认的 `decision / preference / constraint` 放在“已确认决策与偏好”区。
-- 活动任务放在“当前任务”区。
-- 事实、历史和未核实内容放在参考区，并明确禁止将其当成用户指令。
-- 只选择 Agent 全局项和当前对手方项。
-- 每份快照包含内容哈希版本、生成时间、结构化原数据和提示词文本。
-- 提示词投影最多 18,000 字符，超过时保留已按优先级排序的前部内容。
-
-这份上下文由平台生成并追加到任务层。即使普通任务层被关闭，受控的工作状态仍可注入；它不能覆盖平台层、身份边界、工具权限和安全规则。
-
-## 6. 记忆写入规则
-
-### 用户确认的行动
-
-直聊中经用户点击确认的 Memory 会写为 `confirmed`。更新和归档必须携带当前 ID 和 `expectedVersion`；如果期间另一个操作已修改该条目，API 返回 `409`，避免旧快照覆盖新决策。
-
-### 模拟后自动提取
-
-模拟结束后，记忆提取器只能输出增量的 `fact / preference / constraint / note`，最多 12 条。程序会将它们强制标为 `unverified`；模型即使输出 `confirmed` 也不会自动升级。信息冲突时可保留 `conflicted`。
-
-自动提取不能生成 `decision`。用户决策必须通过手动编辑或直聊确认门进入，避免 Agent 把自己的建议写成用户已决定的事。
-
-### 旧数据迁移
-
-如果当前资料还有旧版整块 JSON 记忆，首次加载时会幂等地导入为一条低优先级、未核实的 `note`。原值仍保留用于查看历史模拟结果，不再作为新运行的主记忆源。
-
-## 7. API
-
-所有路由都需要登录。写请求另外校验同源，并且所有请求都需要有效的 `x-agent-memory-scope`。Agent ID 必须存在于服务端已保存的资料库中。
+## 8. 主要接口
 
 | 方法 | 路由 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/memories` | 按 Agent、状态、类型、对手方和关键字查询 |
-| `POST` | `/api/memories` | 创建 Memory |
-| `GET` | `/api/memories/:id` | 读取单条 Memory |
-| `PATCH` | `/api/memories/:id` | 更新、确认或恢复 Memory |
-| `DELETE` | `/api/memories/:id` | 归档 Memory |
-| `GET` | `/api/tasks` | 查询 Agent 任务 |
-| `POST` | `/api/tasks` | 创建任务 |
-| `PATCH` | `/api/tasks/:id` | 更新任务 |
-| `DELETE` | `/api/tasks/:id` | 取消任务 |
-| `POST` | `/api/agent-actions` | 原子执行用户确认的行动批次 |
-| `GET` | `/api/agent-context` | 编译当前 Agent 的 Working Context |
+| `GET/POST` | `/api/memories` | 查询或创建 Memory |
+| `GET/PATCH/DELETE` | `/api/memories/:id` | 读取、修改、恢复或归档 Memory |
+| `GET/POST` | `/api/tasks` | 查询或创建任务 |
+| `PATCH/DELETE` | `/api/tasks/:id` | 修改或取消任务 |
+| `POST` | `/api/agent-actions` | 自动原子执行 Agent 行动批次 |
+| `GET` | `/api/agent-context` | 生成最新 Working Context |
+| `GET/POST` | `/api/relationships` | 查询、创建或完成连续对接 episode |
+| `POST` | `/api/model` | 模型调用及私有文件/记忆只读工具循环 |
 
-## 8. 主要代码位置
+## 9. 代码位置
 
-- `lib/memory-store.ts`：SQLite 表、CRUD、幂等、乐观锁、审计事件和行动事务。
-- `lib/memory-context.ts`：按 Agent / 对手方筛选并生成 Working Context。
-- `lib/agent-state-api.ts`：作用域、Agent 校验和 API 通用逻辑。
-- `app/api/memories/`、`app/api/tasks/`：Memory 与任务 API。
-- `app/api/agent-actions/`：确认后的批量行动 API。
-- `app/api/agent-context/`：工作上下文 API。
-- `lib/defaults.ts`：上下文注入、直聊行动协议、增量记忆和日报提示词组合。
-- `app/DemoApp.tsx`：面板 UI、调用编排、确认门、模拟快照、日报和旧数据迁移。
-- `tests/memory-store.test.ts`：CRUD、幂等、版本冲突、上下文投影和批量回滚测试。
+- `lib/memory-store.ts`：Memory、任务、审计、幂等批次和旧作用域迁移。
+- `lib/memory-context.ts`：Working Context 筛选与提示词投影。
+- `lib/relationship-store.ts`：连续对接关系和 episode。
+- `app/api/agent-actions/route.ts`：自主行动校验与执行边界。
+- `app/api/relationships/route.ts`：关系读取和完成接口。
+- `app/api/model/route.ts`：`search_agent_memory` 与私有文件工具。
+- `lib/defaults.ts`：连续对接、直聊行动和模拟记忆维护提示词。
+- `app/DemoApp.tsx`：运行编排、自动执行、关系续接和 UI。
 
-## 9. 运行与验证
+## 10. 验证
 
 ```bash
-npm run test:memory
-npm run test
+npm run test:unit
+npm run lint
+npm run build
 ```
 
-`test:memory` 使用临时目录中的 SQLite，不会改动开发数据。`npm run test` 会依次执行 ESLint、Memory 测试和 Next.js 生产构建。
-
-## 10. 当前边界与后续方向
-
-当前版本是适合 Demo 验证的基础版，有以下明确边界：
-
-- 查询使用 SQLite 关键字搜索和确定性规则，暂无 embedding / 语义检索。Memory 规模增长后可增加向量召回，也可在届时接入 Mem0，但仍建议保留本次的确认门与任务表。
-- 没有后台自动计划器。已确认决策和任务会影响下一次 Agent 行为，但不会自己定时调用邮件、日历或其他外部系统。
-- 审计事件已入库，尚无查看和回滚 UI。
-- `scope_id` 是 Demo 级浏览器作用域，不替代正式多用户认证、租户隔离、加密、留存和导出/删除策略。
-- Working Context 为了可调试会包含完整结构化项，项目扩大后应加入 token 预算、摘要、时效衰减和更细的召回排序。
+测试覆盖 Memory CRUD、恢复、幂等、批量回滚、模拟核实边界、连续 episode 和完成幂等。生产构建同时执行 TypeScript 校验。

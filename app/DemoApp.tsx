@@ -21,6 +21,7 @@ import {
   selectiveDisclosureKey,
 } from "@/lib/defaults";
 import { attachPresetDemoFileIds } from "@/lib/demo-file-links";
+import { normalizeExtractedMemories } from "@/lib/model-response";
 import type {
   AgentProfile,
   AgentFileRecord,
@@ -2348,19 +2349,37 @@ export default function DemoApp() {
     let callError: string | null = null;
     let toolCalls: ToolExecutionTrace[] = [];
     abortRef.current = new AbortController();
+    const requestBody = {
+      messages: params.messages,
+      maxTokens: Math.max(2048, params.maxTokens),
+      agentRole: params.agentRole,
+      profileId: params.agentRole ? params.snapshot[params.agentRole].id : undefined,
+      fileIds: params.fileIds,
+      toolsEnabled: params.toolsEnabled,
+    };
     try {
-      const response = await fetch("/api/model", {
+      let response = await fetch("/api/model", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: params.messages,
-          maxTokens: params.maxTokens,
-          agentRole: params.agentRole,
-          profileId: params.agentRole ? params.snapshot[params.agentRole].id : undefined,
-          fileIds: params.fileIds,
-          toolsEnabled: params.toolsEnabled,
-        }), signal: abortRef.current.signal,
+        body: JSON.stringify(requestBody), signal: abortRef.current.signal,
       });
-      const data = await response.json().catch(() => ({}));
+      let data = await response.json().catch(() => ({}));
+      // 兼容网关偶发空 content：客户端再以更高 token、关闭工具重试一次。
+      if ((!response.ok && String(data.error || "").includes("空内容"))
+        || (response.ok && typeof data.content === "string" && !data.content.trim())) {
+        response = await fetch("/api/model", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...requestBody,
+            maxTokens: Math.max(4096, requestBody.maxTokens),
+            toolsEnabled: false,
+            messages: [
+              ...params.messages,
+              { role: "user" as const, content: "请直接输出合法且非空的 JSON 对象，不要调用工具，不要输出解释。" },
+            ],
+          }), signal: abortRef.current.signal,
+        });
+        data = await response.json().catch(() => ({}));
+      }
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
       raw = data.content;
       toolCalls = Array.isArray(data.toolCalls) ? data.toolCalls : [];
@@ -2429,7 +2448,22 @@ export default function DemoApp() {
       const systemPrompt = isPublic ? snapshot.evaluatorPrompt : composeMemoryPrompt(snapshot, role, workingContext);
       const actor = isPublic ? "evaluator" as const : role;
       const type: DebugCall["type"] = isPublic ? "public_evaluation" : role === "investor" ? "investor_memory" : "founder_memory";
-      const previousMemory = isPublic ? "" : `\n\n【本次运行开始时冻结的${ROLE_LABEL[role]}工作状态】\n${workingContext == null ? "（暂无结构化工作状态）" : JSON.stringify(workingContext, null, 2)}`;
+      // 提取请求只带精简去重参考，避免旧版整块 JSON / promptText 诱导空 memories。
+      const extractionContext = workingContext == null ? null : {
+        agentId: workingContext.agentId,
+        counterpartyId: workingContext.counterpartyId,
+        version: workingContext.version,
+        tasks: workingContext.tasks.map((task) => ({
+          id: task.id, title: task.title, status: task.status, priority: task.priority,
+        })),
+        memories: workingContext.memories
+          .filter((memory) => memory.sourceType !== "legacy_blob")
+          .map((memory) => ({
+            id: memory.id, kind: memory.kind, title: memory.title,
+            content: memory.content.slice(0, 500), verification: memory.verification, priority: memory.priority,
+          })),
+      };
+      const previousMemory = isPublic ? "" : `\n\n【本次运行开始时冻结的${ROLE_LABEL[role]}工作状态（去重参考，不含旧版整块占位）】\n${extractionContext == null ? "（暂无结构化工作状态）" : JSON.stringify(extractionContext, null, 2)}`;
       const userContent = `${profileContext}${previousMemory}\n\n【完整对话】\n${transcript}\n\nconversation_id: ${record.conversationId}\ninvestor_agent_id: ${snapshot.investor.id}\nfounder_agent_id: ${snapshot.founder.id}\nconversation_end_reason: ${record.endReason || "unknown"}`;
       try {
         const response = await modelCall({ record, type, actor, round: null, systemPrompt,
@@ -2438,21 +2472,33 @@ export default function DemoApp() {
           messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
           maxTokens: Math.max(4096, snapshot.settings.maxTokens), snapshot,
           agentRole: isPublic ? undefined : role,
-          fileIds: isPublic ? undefined : record.fileSnapshots[role].filter((file) => file.status === "ready").map((file) => file.id),
-          toolsEnabled: !isPublic && snapshot[role].prompts.tools.enabled,
+          // 会后提取只需对话与资料，启用文件工具容易空回复或误检索。
+          toolsEnabled: false,
         });
         const result = await parseWithRepair(response.raw, type, record, snapshot);
         record.results[kind] = result;
         if (kind === "public") setPublicResult(result);
         if (kind === "investorMemory") {
-          await persistExtractedMemories("investor", result, record.conversationId, snapshot.founder.id);
-          updateProfileById("investor", snapshot.investor.id, { memory: clone(result) });
           if (config.investor.id === snapshot.investor.id) setInvestorMemory(result);
+          updateProfileById("investor", snapshot.investor.id, { memory: clone(result) });
+          try {
+            await persistExtractedMemories("investor", result, record.conversationId, snapshot.founder.id);
+          } catch (persistError: unknown) {
+            const error = `投资人记忆写入失败：${persistError instanceof Error ? persistError.message : String(persistError)}`;
+            record.errors.push(error);
+            setErrors([...record.errors]);
+          }
         }
         if (kind === "founderMemory") {
-          await persistExtractedMemories("founder", result, record.conversationId, snapshot.investor.id);
-          updateProfileById("founder", snapshot.founder.id, { memory: clone(result) });
           if (config.founder.id === snapshot.founder.id) setFounderMemory(result);
+          updateProfileById("founder", snapshot.founder.id, { memory: clone(result) });
+          try {
+            await persistExtractedMemories("founder", result, record.conversationId, snapshot.investor.id);
+          } catch (persistError: unknown) {
+            const error = `创业者记忆写入失败：${persistError instanceof Error ? persistError.message : String(persistError)}`;
+            record.errors.push(error);
+            setErrors([...record.errors]);
+          }
         }
         saveRecordProgress(record);
       } catch (caught: unknown) {
@@ -2467,27 +2513,21 @@ export default function DemoApp() {
     }
 
     async function persistExtractedMemories(role: AgentRole, result: unknown, conversationId: string, counterpartyId: string) {
-      const candidates = Array.isArray(asRecord(result).memories) ? asRecord(result).memories as unknown[] : [];
-      for (const [index, candidate] of candidates.slice(0, 12).entries()) {
-        const item = asRecord(candidate);
-        const allowedKinds = new Set(["fact", "preference", "constraint", "note"]);
-        if (!allowedKinds.has(String(item.kind)) || typeof item.title !== "string" || !item.title.trim()
-          || typeof item.content !== "string" || !item.content.trim()) continue;
-        // 模拟对话来自另一个 Agent，不能因为模型输出 confirmed 就自动升级为用户确认。
-        const verification = item.verification === "conflicted" ? "conflicted" : "unverified";
+      const drafts = normalizeExtractedMemories(result);
+      for (const [index, draft] of drafts.entries()) {
         await agentStateRequest("/api/memories", {
           method: "POST",
           body: JSON.stringify({
             agentId: snapshot[role].id,
-            kind: item.kind,
-            title: item.title,
-            content: item.content,
-            verification,
-            priority: typeof item.priority === "number" ? item.priority : 50,
+            kind: draft.kind,
+            title: draft.title,
+            content: draft.content,
+            verification: draft.verification,
+            priority: draft.priority,
             counterpartyId,
             sourceType: "simulation",
             sourceId: `${conversationId}:${role}:${index}`,
-            metadata: { conversationId, sourceTurns: Array.isArray(item.source_turns) ? item.source_turns : [] },
+            metadata: { conversationId, sourceTurns: draft.sourceTurns },
           }),
         });
       }

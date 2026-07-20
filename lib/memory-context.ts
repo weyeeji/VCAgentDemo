@@ -11,7 +11,11 @@ function relevantToCounterparty(item: { counterpartyId: string | null }, counter
 function memoryLine(memory: AgentMemoryItem): string {
   const verification = memory.verification === "confirmed" ? "已确认"
     : memory.verification === "conflicted" ? "有冲突" : "未核实";
-  return `- [${memory.id} · v${memory.version} · ${verification} · P${memory.priority}] ${memory.title}：${memory.content}`;
+  // 旧版整块 JSON 迁移条目体积大且易诱导“无增量”；投影时只保留占位说明。
+  const content = memory.sourceType === "legacy_blob"
+    ? "（旧版整块记忆已迁移，仅作历史占位；提取本轮增量时必须以当前对话为准，不得因此输出空数组。）"
+    : memory.content;
+  return `- [${memory.id} · v${memory.version} · ${verification} · P${memory.priority}] ${memory.title}：${content}`;
 }
 
 export function buildWorkingContextSnapshot(

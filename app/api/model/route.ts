@@ -1,5 +1,6 @@
 import { isAuthenticated, isSameOrigin } from "@/lib/auth";
 import { PRIVATE_FILE_TOOL, isAgentRole, listAgentFiles, searchAgentFiles } from "@/lib/file-store";
+import { resolveAssistantContent } from "@/lib/model-response";
 import { getWorkspaceState } from "@/lib/workspace-store";
 import type { AgentRole, ToolExecutionTrace } from "@/lib/types";
 
@@ -47,38 +48,6 @@ interface UpstreamResponse {
   id?: unknown;
 }
 
-function extractAssistantContent(message: UpstreamChoiceMessage | undefined): string | null {
-  if (!message) return null;
-  if (typeof message.content === "string") return message.content;
-  if (Array.isArray(message.content)) {
-    const joined = message.content
-      .map((part) => {
-        if (!part || typeof part !== "object") return "";
-        const entry = part as { type?: unknown; text?: unknown };
-        return entry.type === "text" && typeof entry.text === "string" ? entry.text : "";
-      })
-      .join("");
-    if (joined) return joined;
-  }
-  return null;
-}
-
-function reasoningFallbackContent(message: UpstreamChoiceMessage | undefined): string | null {
-  if (!message || typeof message.reasoning_content !== "string") return null;
-  const reasoning = message.reasoning_content.trim();
-  if (!reasoning) return null;
-  const first = reasoning.indexOf("{");
-  const last = reasoning.lastIndexOf("}");
-  if (first >= 0 && last > first) return reasoning.slice(first, last + 1);
-  return reasoning;
-}
-
-function resolveAssistantContent(message: UpstreamChoiceMessage | undefined): string | null {
-  const content = extractAssistantContent(message);
-  if (content?.trim()) return content;
-  return reasoningFallbackContent(message);
-}
-
 function shouldDisableThinking(forceDisableThinking = false): boolean {
   if (forceDisableThinking) return true;
   const value = process.env.DISABLE_THINKING;
@@ -117,10 +86,14 @@ function explicitPrivateFileRequest(messages: ModelMessage[], fileIds: string[])
   if (!fileIds.length) return null;
   const latestUserMessage = [...messages].reverse().find((message) => message.role === "user")?.content?.trim() || "";
   if (!latestUserMessage) return null;
+  // 会后记忆/评估请求会把整段对话塞进 user；避免因对话里提到“材料/文件”就误触发预检索。
+  if (latestUserMessage.includes("【完整对话】") || latestUserMessage.includes("conversation_id:")) return null;
   return /(补充材料|私有文件|上传的?(?:文件|资料)|附件|PDF|BP|商业计划书|文件中|材料中|根据.{0,12}(?:材料|文件))/i.test(latestUserMessage)
     ? latestUserMessage.slice(0, 500)
     : null;
 }
+
+const EMPTY_JSON_NUDGE = "上一次模型回复为空或不可用。请立即输出一个合法且非空的 JSON 对象，不要调用工具，不要输出 Markdown 或解释文字。";
 
 export async function POST(request: Request) {
   if (!isSameOrigin(request)) return error("请求来源无效", "仅接受同源请求。", 403);
@@ -179,10 +152,17 @@ export async function POST(request: Request) {
   let requestId: string | null = null;
   let responseModel = model;
 
-  const baseMaxTokens = Math.min(16_000, Math.max(64, Number(body.maxTokens) || 800));
+  // 过低的 max_tokens 在兼容网关/思维链场景下容易只产出空 content。
+  const baseMaxTokens = Math.min(16_000, Math.max(256, Number(body.maxTokens) || 800));
+  const retryMaxTokens = Math.min(16_000, Math.max(baseMaxTokens * 4, 4096));
 
-  async function callUpstream(options?: { maxTokens?: number; forceDisableThinking?: boolean }): Promise<{ data: UpstreamResponse; content: string | null; calls: ToolCall[] }> {
+  async function callUpstream(options?: {
+    maxTokens?: number;
+    forceDisableThinking?: boolean;
+    disableTools?: boolean;
+  }): Promise<{ data: UpstreamResponse; content: string | null; calls: ToolCall[] }> {
     const maxTokens = Math.min(16_000, Math.max(64, Number(options?.maxTokens) || baseMaxTokens));
+    const useTools = toolsEnabled && !options?.disableTools;
     const response = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -192,7 +172,7 @@ export async function POST(request: Request) {
         max_tokens: maxTokens,
         response_format: { type: "json_object" },
         ...(shouldDisableThinking(options?.forceDisableThinking) ? { enable_thinking: false } : {}),
-        ...(toolsEnabled ? { tools: [PRIVATE_FILE_TOOL], tool_choice: "auto" } : {}),
+        ...(useTools ? { tools: [PRIVATE_FILE_TOOL], tool_choice: "auto" } : {}),
       }),
       signal: controller.signal,
     });
@@ -220,16 +200,39 @@ export async function POST(request: Request) {
       finish_reason: data.choices?.[0]?.finish_reason ?? null,
       tool_calls: calls,
       usage: data.usage || null,
+      max_tokens: maxTokens,
+      tools: useTools,
     });
     return { data, content, calls };
+  }
+
+  async function recoverEmptyContent(stage: string): Promise<{ data: UpstreamResponse; content: string | null; calls: ToolCall[] }> {
+    let upstream = await callUpstream({
+      maxTokens: retryMaxTokens,
+      forceDisableThinking: true,
+      disableTools: true,
+    });
+    trace.push({ stage: `${stage}_retry_no_tools`, content: upstream.content, tool_calls: upstream.calls });
+    if (upstream.content?.trim() && !upstream.calls.length) return upstream;
+
+    messages.push({ role: "user", content: EMPTY_JSON_NUDGE });
+    upstream = await callUpstream({
+      maxTokens: retryMaxTokens,
+      forceDisableThinking: true,
+      disableTools: true,
+    });
+    trace.push({ stage: `${stage}_retry_nudge`, content: upstream.content, tool_calls: upstream.calls });
+    return upstream;
   }
 
   async function callUpstreamWithRetry(): Promise<{ data: UpstreamResponse; content: string | null; calls: ToolCall[] }> {
     let upstream = await callUpstream();
     if (!upstream.calls.length && !upstream.content?.trim()) {
+      // 先做一次无工具、提高 token 的快速重试；仍失败则由外层 recoverEmptyContent 再带 nudge。
       upstream = await callUpstream({
-        maxTokens: Math.min(16_000, Math.max(baseMaxTokens * 4, 2048)),
+        maxTokens: retryMaxTokens,
         forceDisableThinking: true,
+        disableTools: true,
       });
       trace.push({ stage: "empty_content_retry", content: upstream.content, tool_calls: upstream.calls });
     }
@@ -276,7 +279,20 @@ export async function POST(request: Request) {
     for (let toolRound = 0; toolRound <= 2; toolRound += 1) {
       const upstream = await callUpstreamWithRetry();
       if (!upstream.calls.length) {
-        if (!upstream.content?.trim()) return error("模型返回空内容", "未收到可用的消息内容。", 502);
+        if (!upstream.content?.trim()) {
+          const recovered = await recoverEmptyContent("final_empty");
+          if (!recovered.content?.trim() || recovered.calls.length) {
+            return error("模型返回空内容", "未收到可用的消息内容。", 502);
+          }
+          return Response.json({
+            content: recovered.content,
+            usage,
+            model: responseModel,
+            requestId,
+            toolCalls,
+            trace,
+          }, { headers: { "Cache-Control": "no-store" } });
+        }
         return Response.json({
           content: upstream.content,
           usage,
@@ -286,8 +302,35 @@ export async function POST(request: Request) {
           trace,
         }, { headers: { "Cache-Control": "no-store" } });
       }
-      if (!toolsEnabled || !activeRole) return error("工具调用失败", "当前调用未启用私有文件工具。", 502);
-      if (toolRound >= 2) return error("工具调用失败", "单次回复超过 2 次工具调用限制。", 502);
+      if (!toolsEnabled || !activeRole) {
+        // 未启用工具却返回 tool_calls：降级为无工具重试，避免整轮失败。
+        const recovered = await recoverEmptyContent("unexpected_tool_calls");
+        if (!recovered.content?.trim() || recovered.calls.length) {
+          return error("工具调用失败", "当前调用未启用私有文件工具。", 502);
+        }
+        return Response.json({
+          content: recovered.content,
+          usage,
+          model: responseModel,
+          requestId,
+          toolCalls,
+          trace,
+        }, { headers: { "Cache-Control": "no-store" } });
+      }
+      if (toolRound >= 2) {
+        const recovered = await recoverEmptyContent("tool_limit");
+        if (!recovered.content?.trim() || recovered.calls.length) {
+          return error("工具调用失败", "单次回复超过 2 次工具调用限制。", 502);
+        }
+        return Response.json({
+          content: recovered.content,
+          usage,
+          model: responseModel,
+          requestId,
+          toolCalls,
+          trace,
+        }, { headers: { "Cache-Control": "no-store" } });
+      }
 
       messages.push({ role: "assistant", content: upstream.content, tool_calls: upstream.calls });
       for (const call of upstream.calls) {

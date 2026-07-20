@@ -12,6 +12,7 @@ import type {
   WorkingContextSnapshot,
 } from "./types";
 import { demoSeedFileIdsByProfile } from "./demo-seed-manifest";
+import { renderWorkingContextPrompt } from "./memory-prompt";
 
 export const LAYER_LABELS: Record<LayerKey, string> = {
   platform: "平台层",
@@ -719,7 +720,11 @@ export function composeDirectChatPrompt(
 7. 输出格式：仍输出一个合法 JSON 对象，并在原 message、control 外增加 actions 数组。没有行动时输出空数组。行动结构：{"id":"简短唯一ID","type":"memory.create|memory.update|memory.archive|memory.restore|task.create|task.update|task.cancel","reason":"为何执行","memoryId":"修改、归档或恢复时必填","taskId":"更新或取消时必填","input":{}}。memory.create 的 input 使用 kind、title、content、priority、counterpartyId；task.create 使用 title、description、priority、dueAt、counterpartyId。操作已有条目时必须使用记忆中提供的 ID 与 expectedVersion。不得批量删除或越过当前 Agent 作用域。
 8. 会后流程：本测试对话不生成公共结果，也不自动触发日报；actions 会由平台自动保存为当前 Agent 长期状态，操作记录可审计。`;
   const directTask = `${taskPrompt.trim() || "（空）"}\n\n【平台规定的结构化行动输出】\n每次回复必须包含 actions 数组，并遵守本次运行设置中的行动规则。`;
-  return composeAgentPrompt(agent, settings, { taskOverride: directTask, runtimeOverride: directChatRuntime, workingContext });
+  const ownerContext = workingContext == null ? workingContext : {
+    ...workingContext,
+    promptText: renderWorkingContextPrompt(workingContext, { audience: "owner" }),
+  };
+  return composeAgentPrompt(agent, settings, { taskOverride: directTask, runtimeOverride: directChatRuntime, workingContext: ownerContext });
 }
 
 export function composeMemoryPrompt(config: AppConfig, role: AgentRole, workingContext?: WorkingContextSnapshot | null): string {
@@ -727,10 +732,14 @@ export function composeMemoryPrompt(config: AppConfig, role: AgentRole, workingC
 只输出合法 JSON：{"actions":[]}。actions 最多 12 条，type 只能是 memory.create、memory.update、memory.archive、memory.restore。
 memory.create 格式：{"id":"","type":"memory.create","reason":"","input":{"kind":"fact|preference|constraint|note","title":"","content":"","verification":"unverified|conflicted","priority":50}}。
 memory.update/archive/restore 必须提供 memoryId，input 必须包含当前状态中的 expectedVersion。对方自报信息只能是 unverified；模拟对话不得修改、归档或恢复 confirmed 记忆，冲突时新建 conflicted 条目。本轮确实无增量时输出空 actions。`;
+  const extractionContext = workingContext == null ? workingContext : {
+    ...workingContext,
+    promptText: renderWorkingContextPrompt(workingContext, { includeLegacyContent: false, audience: "maintenance" }),
+  };
   return composeAgentPrompt(config[role], config.settings, {
     taskOverride: `${config.memoryPrompts[role].trim()}\n\n${memoryActionContract}`,
     includeRuntimeSettings: false,
-    workingContext,
+    workingContext: extractionContext,
   });
 }
 

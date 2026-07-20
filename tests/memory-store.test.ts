@@ -9,6 +9,7 @@ process.env.DATA_DIR = dataDir;
 
 const store = await import("../lib/memory-store");
 const { buildWorkingContextSnapshot } = await import("../lib/memory-context");
+const { renderWorkingContextPrompt, LEGACY_MEMORY_EXTRACTION_PLACEHOLDER } = await import("../lib/memory-prompt");
 
 after(() => rmSync(dataDir, { recursive: true, force: true }));
 
@@ -127,6 +128,31 @@ test("legacy browser memory scope migrates once into the stable workspace scope"
 
   assert.equal(store.listMemories(legacyScope, agentId, { status: "all" }).length, 0);
   assert.equal(store.listMemories(stableScope, agentId, { status: "all" })[0]?.id, legacy.id);
+});
+
+test("legacy memory stays readable in dialogue but is masked for incremental extraction", () => {
+  const scopeId = "test-scope-legacy-projection";
+  const agentId = "investor-demo-003";
+  store.createMemory(scopeId, agentId, "investor", {
+    kind: "note",
+    title: "旧版整块私有记忆（已迁移）",
+    content: JSON.stringify({ summary: "已与云禾智创完成初步对接" }),
+    verification: "confirmed",
+    sourceType: "legacy_blob",
+    sourceId: "legacy-projection",
+  });
+
+  const context = buildWorkingContextSnapshot(scopeId, agentId);
+  assert.match(context.promptText, /云禾智创/);
+  assert.match(context.promptText, /不得向对接方泄露/);
+
+  const ownerPrompt = renderWorkingContextPrompt(context, { audience: "owner" });
+  assert.match(ownerPrompt, /创建者\/管理者/);
+  assert.match(ownerPrompt, /云禾智创/);
+
+  const extractionPrompt = renderWorkingContextPrompt(context, { includeLegacyContent: false, audience: "maintenance" });
+  assert.doesNotMatch(extractionPrompt, /云禾智创/);
+  assert.match(extractionPrompt, new RegExp(LEGACY_MEMORY_EXTRACTION_PLACEHOLDER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("confirmed action batches roll back atomically", () => {

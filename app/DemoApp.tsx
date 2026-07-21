@@ -1594,6 +1594,10 @@ export default function DemoApp() {
   const [promptModal, setPromptModal] = useState<{ title: string; content: string } | null>(null);
   const [versionOpen, setVersionOpen] = useState(false);
   const [recordsOpen, setRecordsOpen] = useState(false);
+  const [clearDataOpen, setClearDataOpen] = useState(false);
+  const [clearAllAgentState, setClearAllAgentState] = useState(false);
+  const [clearDataConfirmation, setClearDataConfirmation] = useState("");
+  const [clearDataBusy, setClearDataBusy] = useState(false);
   const [debugDrawer, setDebugDrawer] = useState(false);
   const [apiState, setApiState] = useState<{ configured: boolean; missing: string[]; model: string | null } | null>(null);
   const [toast, setToast] = useState("");
@@ -3219,6 +3223,80 @@ export default function DemoApp() {
     setToast("已重置当前对话；长期记忆与日报已保留");
   }
 
+  function closeClearDataDialog() {
+    if (clearDataBusy) return;
+    setClearDataOpen(false);
+    setClearAllAgentState(false);
+    setClearDataConfirmation("");
+  }
+
+  async function clearWorkspaceTestData() {
+    if (clearDataBusy || dailyBusy || directChatBusy || ["running", "paused", "stopping", "postprocessing"].includes(status)) return;
+    if (clearAllAgentState && clearDataConfirmation.trim() !== "清除全部") return;
+    setClearDataBusy(true);
+    try {
+      const data = await agentStateRequest("/api/test-data", {
+        method: "DELETE",
+        body: JSON.stringify({ mode: clearAllAgentState ? "all_agent_state" : "simulation" }),
+      });
+
+      setRecords([]);
+      setMessages([]);
+      setDebugCalls([]);
+      setPublicResult(null);
+      setInvestorMemory(null);
+      setFounderMemory(null);
+      setDailyReports({ investor: null, founder: null });
+      setProfiles((current) => {
+        const next = clone(current);
+        (["investor", "founder"] as AgentRole[]).forEach((role) => {
+          next[role] = next[role].map((profile) => ({ ...profile, memory: null, dailyReport: null }));
+        });
+        return next;
+      });
+      if (clearAllAgentState) {
+        setDirectChats(emptyDirectChats());
+        setDirectChatErrors({ investor: "", founder: "" });
+      }
+      setAgentMemories({ investor: [], founder: [] });
+      setAgentTasks({ investor: [], founder: [] });
+      setAgentContexts({ investor: null, founder: null });
+      setActiveRelationship(null);
+      setActiveRecordId(null);
+      setRawErrors({});
+      setErrors([]);
+      setStatus("idle");
+      setRunningRole(null);
+      lastRunRef.current = null;
+      lastRunFilesRef.current = null;
+      lastRunMemoriesRef.current = null;
+      lastRunContinuationRef.current = null;
+      lastRunConversationIdRef.current = null;
+      setRecordsOpen(false);
+      setDebugDrawer(false);
+      setClearDataOpen(false);
+      setClearAllAgentState(false);
+      setClearDataConfirmation("");
+
+      try {
+        await Promise.all(([
+          ["investor", config.investor.id],
+          ["founder", config.founder.id],
+        ] as const).map(([role, agentId]) => refreshAgentState(role, agentId)));
+      } catch (caught) {
+        setErrors([`测试数据已清除，但刷新 Agent 状态失败：${caught instanceof Error ? caught.message : String(caught)}`]);
+      }
+      const result = asRecord(data.result);
+      const clearedCount = ["relationships", "relationshipEpisodes", "memories", "tasks"]
+        .reduce((sum, key) => sum + (Number(result[key]) || 0), 0);
+      setToast(`${clearAllAgentState ? "全部 Agent 学习状态" : "模拟测试数据"}已清除${clearedCount ? ` · ${clearedCount} 项` : ""}`);
+    } catch (caught) {
+      setErrors((current) => [...current, `清除测试数据失败：${caught instanceof Error ? caught.message : String(caught)}`]);
+    } finally {
+      setClearDataBusy(false);
+    }
+  }
+
   function saveVersion() {
     if (profileDraftsBlock("保存命名版本")) return;
     const name = window.prompt("为当前配置命名", `配置 ${versions.length + 1}`)?.trim();
@@ -3388,6 +3466,7 @@ export default function DemoApp() {
               {busy && <button className="danger" onClick={stop}>■ 停止</button>}
               {!busy && messages.length > 0 && <button disabled={!workspacePersisted || dailyBusy !== null || directChatBusy !== null || Object.values(profileDirty).some(Boolean)} onClick={rerunLastSnapshot}>↻ 按原快照重新生成</button>}
               <button disabled={dailyBusy !== null || directChatBusy !== null || (busy && status !== "paused")} onClick={reset}>重置</button>
+              <button className="danger" disabled={modelBusy || clearDataBusy} onClick={() => { setClearAllAgentState(false); setClearDataConfirmation(""); setClearDataOpen(true); }}>清除测试数据</button>
             </div>
             {startBlockedReason && <div className="run-block-reason">{startBlockedReason}</div>}
             <div className="run-settings-note">同一对 Agent 默认续接上次摘要、最近发言与双方最新 Memory；每次运行仍保留独立快照。</div>
@@ -3532,6 +3611,8 @@ export default function DemoApp() {
         />;
         })}
       </section>
+
+      {clearDataOpen && <div className="modal-backdrop" onMouseDown={closeClearDataDialog}><section className="modal clear-data-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>TEST DATA CLEANUP</p><h2>清除测试数据</h2></div><button disabled={clearDataBusy} onClick={closeClearDataDialog}>×</button></div><div className="clear-data-body"><div className="clear-data-summary"><strong>默认清除范围</strong><ul><li>本浏览器中的全部双 Agent 模拟记录、消息、结果与调试轨迹</li><li>工作区中的全部 Agent 对接关系、累计摘要与最近发言</li><li>模拟对话和旧版迁移产生的 Memory、Task 及相关审计记录</li><li>当前结果和基于旧状态生成的日报</li></ul></div><div className="clear-data-kept"><strong>默认保留</strong><p>Agent 资料、提示词、配置版本、上传文件、用户与 Agent 的直接对话，以及手工/用户直聊产生的 Memory 与 Task。</p></div><label className={`clear-data-option ${clearAllAgentState ? "selected" : ""}`}><input type="checkbox" checked={clearAllAgentState} disabled={clearDataBusy} onChange={(event) => { setClearAllAgentState(event.target.checked); setClearDataConfirmation(""); }} /><span><strong>同时清除用户直聊与全部 Agent Memory/Task</strong><em>用于彻底恢复没有学习状态的测试环境；文件、Agent 资料和配置仍会保留。</em></span></label>{clearAllAgentState && <label className="clear-data-confirm"><span>这是不可恢复的操作，请输入“清除全部”</span><input autoFocus value={clearDataConfirmation} disabled={clearDataBusy} onChange={(event) => setClearDataConfirmation(event.target.value)} placeholder="清除全部" /></label>}<p className="clear-data-note">其他浏览器本地保存的模拟记录无法从这里删除，但其共享的关系与 Memory 状态会被清除。</p></div><div className="modal-foot clear-data-foot"><span>{clearAllAgentState ? "高风险模式：所有 Agent 学习状态都会删除" : "不会删除文件、资料、配置或用户直聊"}</span><div><button disabled={clearDataBusy} onClick={closeClearDataDialog}>取消</button><button className="danger" disabled={clearDataBusy || (clearAllAgentState && clearDataConfirmation.trim() !== "清除全部")} onClick={() => void clearWorkspaceTestData()}>{clearDataBusy ? "清除中…" : clearAllAgentState ? "确认清除全部状态" : "确认清除模拟数据"}</button></div></div></section></div>}
 
       {promptModal && <div className="modal-backdrop" onMouseDown={() => setPromptModal(null)}><section className="modal prompt-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-head"><div><p>实际请求预览</p><h2>{promptModal.title}</h2></div><button onClick={() => setPromptModal(null)}>×</button></div><pre>{promptModal.content}</pre><div className="modal-foot"><span>{promptModal.content.length} 字符 · ≈{tokenEstimate(promptModal.content)} tokens</span><button onClick={() => { copyText(promptModal.content); setToast("已复制完整提示词"); }}>复制完整提示词</button></div></section></div>}
 
